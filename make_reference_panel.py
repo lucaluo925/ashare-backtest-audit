@@ -29,7 +29,7 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from ashare_audit_standalone import limit_pct  # noqa: E402
+from ashare_audit_standalone import has_price_limit, limit_pct  # noqa: E402
 
 
 # 判定封板用**半分容差**，不用取整后精确相等。
@@ -100,6 +100,27 @@ def build(codes, start, end, out):
     # 开盘封板：按开盘价成交的引擎，看的是这两个
     p["open_limit_up"] = (p["open"] - up).abs() <= TOL
     p["open_limit_down"] = (p["open"] - dn).abs() <= TOL
+
+    # **新股上市前 5 个交易日不设涨跌幅**（注册制），那几天不存在"封板"。
+    #
+    # 上市天数只在该股**第一根 K 线晚于取数起点**时才可信 —— 否则它在窗口
+    # 开始前就已上市，cumcount 数出来的不是上市天数。判不准就按"有限制"
+    # 处理（保守），因为误判成无限制会让真实封板漏掉。
+    p = p.sort_values(["code", "date"])
+    first = p.groupby("code", observed=True)["date"].transform("min")
+    win_start = p["date"].min()
+    nth = p.groupby("code", observed=True).cumcount() + 1
+    known = first > win_start                 # 窗口内才上市 → 天数可信
+    dsl = nth.where(known)
+    no_limit = ~pd.Series(
+        [has_price_limit(c, d, None if pd.isna(k) else int(k))
+         for c, d, k in zip(p["code"], p["date"].dt.strftime("%Y-%m-%d"), dsl)],
+        index=p.index)
+    n_nl = int(no_limit.sum())
+    if n_nl:
+        print(f"  新股前 5 日无涨跌幅：{n_nl:,} 行，已清除其封板标记")
+    for c in ("limit_up", "limit_down", "open_limit_up", "open_limit_down"):
+        p.loc[no_limit, c] = False
 
     # close_raw 用来算复牌首日的跳空幅度（held_through_suspension 检查）
     p["close_raw"] = p["close"]

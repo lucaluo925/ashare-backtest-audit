@@ -53,6 +53,64 @@ def limit_pct(code, is_st, date):
     return 0.10
 
 
+# ---------- 板块 ----------
+
+def board(code):
+    """返回 主板 / 创业板 / 科创板 / 北交所。"""
+    if code.startswith("bj."):
+        return "北交所"
+    if code.startswith("sh.688"):
+        return "科创板"
+    if code.startswith("sz.3"):
+        return "创业板"
+    return "主板"
+
+
+# ---------- 新股上市初期：不设涨跌幅 ----------
+#
+# 注册制下新股**上市前 5 个交易日不设涨跌幅限制**（盘中有 30%/60% 临时停牌，
+# 但那不是价格上限）。第 6 个交易日起才按板块的常规幅度。
+#
+# 各板块开始适用的日期不同：
+REGISTRATION_FROM = {
+    "科创板": "2019-07-22",      # 开市即注册制
+    "创业板": "2020-08-24",      # 注册制改革
+    "主板": "2023-04-10",        # 全面注册制首批上市
+}
+NO_LIMIT_DAYS = 5               # 上市后前 5 个交易日
+
+# 为什么这条必须有：不加它，新股上市头几天会被算出一个涨停价，
+# 而那几天股价可以翻倍 —— 于是要么凭空判出"封板"，要么把真实的
+# 大幅波动当成异常。这是审计器发布之后才发现的一个自身 bug。
+#
+# **规则已写进这里，但审计器还没用上它**，说清楚免得被当成已修：
+# 参考面板的构建脚本（make_reference_panel.py）会用它清掉新股前 5 日的
+# 封板标记；而 ashare_audit 的 check_limit_rule **拿不到上市天数** ——
+# 成交记录里没有这一列、面板里也没有、CLI 也没有入口。所以审计器对
+# 新股前 5 个交易日仍然会说"实际 ±10%"。这不是接一下线就能修的，
+# 要么面板加一列上市天数，要么这一项永远只在面板侧生效。
+
+
+def has_price_limit(code, date, days_since_listing=None):
+    """当日是否**存在**涨跌幅限制。
+
+    days_since_listing：上市后的第几个交易日（上市首日 = 1）。
+    **传 None 表示不知道** —— 那就按"有限制"处理（保守），因为误判成
+    "无限制"会让真实的封板漏掉，而封板漏掉正是本工具要查的东西。
+    """
+    if days_since_listing is None:
+        return True
+    if days_since_listing > NO_LIMIT_DAYS:
+        return True
+    eff = REGISTRATION_FROM.get(board(code))
+    if eff is None:
+        # 北交所新股上市初期的安排我没核到原文 —— 按"有限制"处理（保守），
+        # 不照着沪深猜。原来这里是 REGISTRATION_FROM[...]，北交所代码直接
+        # KeyError，是代码审查抓出来的。
+        return True
+    return date < eff          # 注册制生效之前，老规则仍有涨跌幅
+
+
 # ---------- 印花税 ----------
 #
 # (生效日, bps, 是否双边)。倒序，取第一个 date >= eff 的。
@@ -86,6 +144,49 @@ def stamp_is_both_sides(date):
     return _lookup(date)[1]
 
 
+# ---------- 其余交易费用 ----------
+#
+# 来源：券商官方费用公示（2023-09-13 生效版本）。**只覆盖当前档，不含历史**
+# —— 过户费的历史沿革我没有核到一手资料，所以这里不编造日期表。
+# 印花税是唯一做了历史分段的一项（见上），因为那几档有明确的财税文件。
+#
+# 单位统一成"占成交金额的比例"。
+TRANSFER_FEE_RATE = 0.00001      # 过户费 0.001%，**双边**，沪深统一
+HANDLING_FEE_RATE = 0.0000341    # 经手费 0.0341‰，双边
+REGULATORY_FEE_RATE = 0.00002    # 证管费 0.02‰，双边
+MIN_COMMISSION_YUAN = 5.0        # 佣金起点 5 元/笔（券商普遍）
+MAX_COMMISSION_RATE = 0.003      # 佣金上限 0.3%
+
+
+def regulatory_cost_rate(date, side):
+    """**不含券商佣金**的监管类费用合计（占成交金额）。
+
+    这是任何人都躲不掉的地板，而多数回测只算了佣金和印花税，
+    漏掉过户费、经手费、证管费 —— 三项双边合计约 0.0064%，
+    一轮买卖约 1.3bp。单看不大，高换手策略上会累积。
+    """
+    if side not in ("buy", "sell"):
+        raise ValueError(f"side 应为 buy/sell，收到 {side!r}")
+    r = TRANSFER_FEE_RATE + HANDLING_FEE_RATE + REGULATORY_FEE_RATE
+    if side == "sell":
+        r += stamp_duty_bps_on(date) / 1e4
+    elif stamp_is_both_sides(date):
+        r += stamp_duty_bps_on(date) / 1e4
+    return r
+
+
+def commission_on(notional, rate, min_yuan=MIN_COMMISSION_YUAN):
+    """实际佣金 —— **起点 5 元**是小额交易上最大的一项成本失真。
+
+    10,000 元的单子按万 2.5 只有 2.5 元，但实际收 5 元，实际费率翻倍；
+    5,000 元的单子实际费率是名义的 4 倍。回测用固定 bps 时，
+    资金越小、单笔越小，低估得越厉害。
+    """
+    if notional < 0:
+        raise ValueError("成交金额不能为负")
+    return max(notional * rate, min_yuan) if notional > 0 else 0.0
+
+
 # ---------- 熔断 ----------
 #
 # A 股史上仅此一次：机制 2016-01-01 生效、2016-01-08 暂停，其间触发两次。
@@ -98,17 +199,187 @@ def is_circuit_breaker(date):
     return date in CIRCUIT_BREAKER_DAYS
 
 
-# ---------- 板块 ----------
+# ---------- 申报数量：整手、递增单位、单笔上限 ----------
+#
+# 出处（一手）：
+#   《上海证券交易所交易规则（2023 年修订）》
+#     3.3.8 买入申报数量应当为 100 股（份）或其整数倍；
+#           卖出时余额不足 100 股（份）的部分应当一次性申报卖出
+#     3.3.9 单笔申报最大数量不超过 100 万股（份）
+#     3.3.11 A 股申报价格最小变动单位 0.01 元
+#   《深圳证券交易所交易规则》
+#     3.3.8 同上（买入 100 股整数倍、卖出零股一次性申报）
+#     3.3.10 单笔申报最大数量不超过 100 万股（份）
+#     3.3.13 A 股申报价格最小变动单位 0.01 元
+#     —— 沪深主板各有自己的条款，不是拿上交所的往深市套
+#   《上海证券交易所科创板股票交易特别规定》第二十条
+#     限价申报 ≥200 股且 ≤10 万股；市价申报 ≥200 股且 ≤5 万股；
+#     卖出余额不足 200 股的部分一次性申报卖出
+#   《深圳证券交易所创业板交易特别规定》2.8
+#     限价申报 ≤30 万股；市价申报 ≤15 万股（盘后定价 ≤100 万股，本表不含）
+#
+# **1 股递增只在科创板和北交所**：沪深主板与创业板买入仍须 100 股的整数倍。
+# 科创板那半句有原文（特别规定第二十条）；主板"100+1"的说法在交易所规则
+# 原文里没有找到对应条款，所以下面按规则原文的 100 股整数倍处理。
+#
+# **北交所的申报数量规则我一条原文都没核到**，所以下面的表里干脆没有北交所。
+# 不是忘了 —— 填一个"看起来对"的数（比如照主板抄 100 万股）正是这个项目
+# 反复改掉的那类错：把一处规则推广到没查过的地方，而且不留痕迹。
+# 查不到就不判，order_shares_ok() 对北交所返回 None（"未核"），不返回 True。
+#
+# 这一组规则只有在回测输出**股数**时才查得动。绝大多数回测输出的是权重，
+# 那种情况下审计器不猜，直接跳过并说明为什么跳过。
 
-def board(code):
-    """返回 主板 / 创业板 / 科创板 / 北交所。"""
-    if code.startswith("bj."):
-        return "北交所"
-    if code.startswith("sh.688"):
-        return "科创板"
-    if code.startswith("sz.3"):
-        return "创业板"
-    return "主板"
+TICK_SIZE_YUAN = 0.01          # A 股申报价格最小变动单位
+
+MIN_ORDER_SHARES = {"主板": 100, "创业板": 100, "科创板": 200}
+LOT_INCREMENT = {"主板": 100, "创业板": 100, "科创板": 1}
+MAX_ORDER_SHARES = {
+    "主板": {"limit": 1_000_000, "market": 1_000_000},
+    "创业板": {"limit": 300_000, "market": 150_000},
+    "科创板": {"limit": 100_000, "market": 50_000},
+}
+UNVERIFIED_QTY_BOARDS = ("北交所",)     # 原文未核，一律不判
+
+
+def min_order_shares(code):
+    """买入的最小申报数量（股）；未核的板块返回 None。"""
+    return MIN_ORDER_SHARES.get(board(code))
+
+
+def lot_increment(code):
+    """最小申报数量之上的递增单位（股）；未核的板块返回 None。"""
+    return LOT_INCREMENT.get(board(code))
+
+
+def max_order_shares(code, order_type="limit"):
+    """单笔申报数量上限（股）；未核的板块返回 None。"""
+    if order_type not in ("limit", "market"):
+        raise ValueError("order_type 只能是 'limit' 或 'market'")
+    t = MAX_ORDER_SHARES.get(board(code))
+    return None if t is None else t[order_type]
+
+
+def order_shares_ok(code, shares, side="buy", order_type="limit"):
+    """这个股数能不能报进交易所。
+
+    返回 (ok, 原因)，**ok 是三态**：
+      True  —— 合规
+      False —— 违规，原因在第二项
+      None  —— 该板块的规则我没核到原文，不判（目前只有北交所）
+
+    None 不是 True。审计器把它单独统计、单独提示，不当成"通过"。
+
+    卖出侧比买入宽：持仓里不足一手的零股**必须**一次性卖出，所以
+    "卖 37 股"是合法的、"买 37 股"不是。代价是**卖出侧只查上限、
+    不查整手** —— 持仓 5000 股卖 150 股（违规）这种查不出来，
+    因为审计器看不到持仓数量。这是刻意取舍，不是遗漏。
+    """
+    if side not in ("buy", "sell"):
+        raise ValueError("side 只能是 'buy' 或 'sell'")
+    if shares is None or shares != shares:          # None / NaN / pd.NA
+        return None, "申报数量缺失，不判"
+    try:
+        x = float(shares)
+    except (TypeError, ValueError):
+        return None, f"申报数量不是数字（{shares!r}），不判"
+    if x != x or x in (float("inf"), float("-inf")):
+        return None, "申报数量不是有限数，不判"
+    if x <= 0:
+        return False, "申报数量必须为正"
+    n = round(x)
+    # 容差：权重换算出来的股数常带浮点尾差（300*1.0000000000000002），
+    # 严格 != int 会把它判成"非整数股"。真正的非整数（100.5）仍要拦。
+    if abs(x - n) > 1e-6 * max(1.0, abs(x)):
+        return False, "申报数量必须是整数股"
+    shares = int(n)
+    if board(code) in UNVERIFIED_QTY_BOARDS:
+        return None, f"{board(code)}的申报数量规则未核到原文，不判"
+    cap = max_order_shares(code, order_type)
+    if cap is not None and shares > cap:
+        return False, f"超过单笔申报上限 {cap:,} 股（{board(code)}，{order_type}）"
+    if side == "sell":
+        return True, ""                              # 零股必须一次性卖出
+    lo = min_order_shares(code)
+    if shares < lo:
+        return False, f"低于最小申报数量 {lo} 股（{board(code)}）"
+    step = lot_increment(code)
+    if step > 1 and shares % step:
+        return False, f"买入须为 {step} 股的整数倍（{board(code)}）"
+    return True, ""
+
+
+def price_on_tick(price, tick=TICK_SIZE_YUAN, rel_tol=1e-6):
+    """申报价格是否落在最小变动单位上。
+
+    **容差必须是相对的，而且要留到 1e-6 这一档**，两个原因：
+
+    1. 合法价格自己就带累积误差。0.07*3 在 float 里是
+       0.21000000000000002，8.8*1.15 是 10.12 差一点 —— 按复权因子
+       还原出来的价格全是这种数，严格相等会把它们全判成违规。
+    2. **float32**。很多面板（包括本项目自己的）价格列是 float32，
+       10 元量级的表示误差约 2e-7。容差如果按 1e-9 这种绝对量级定，
+       一份完全合法的 float32 价格表会被判成 100% 违规 ——
+       这个坑是代码审查抓出来的，原来的实现就是这么写的。
+
+    真正要拦的是分以下的价格（33.333333、4.755），它们离最近的分
+    有 1e-3 量级的距离，与上面两种误差差着三个数量级。
+    """
+    if price is None or price != price:
+        return False
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return False
+    if not (p > 0) or p in (float("inf"), float("-inf")):
+        return False
+    n = round(p / tick)
+    return abs(p - n * tick) <= rel_tol * max(tick, abs(p))
+
+
+# ---------- 风险警示板 / 退市整理期 ----------
+#
+# 出处（一手规则原文）：《上海证券交易所风险警示板股票交易管理办法》
+#   （2013-01-01 实施，此后 2015-01-30 / 2017-06-28 / 2018-08-06 /
+#     2020-05 / 2020-12 五次修订）
+#   第七条 风险警示股票价格涨跌幅限制为 5%；退市整理期股票涨跌幅限制为 10%
+#   第八条 退市整理期首个交易日无价格涨跌幅限制
+#   第十四条 投资者当日通过竞价交易和大宗交易**累计**买入的单只
+#           风险警示股票，数量不得超过 50 万股
+#
+# 这里有一个回测几乎必错的地方：**退市整理期的股票带 ST 标记，但涨跌幅是
+# ±10% 不是 ±5%**。把"风险警示 → ±5%"一刀切，会把退市整理期那十几天
+# 的涨跌停全判错。limit_pct() 覆盖不了这一条（它只看 is_st）。
+#
+# **下面的函数写了规则，但审计器没有调用它**，写明免得当成已修：判定需要
+# "这一天是不是这只股票的退市整理期、是不是首日"，而免费面板只有股票的
+# **当前**名称，用当前名称去标历史会把这只股票的整段历史全标错。
+# 换句话说：规则是对的，数据不够，所以不判 —— 不是忘了接。
+#
+# 未核的部分，写清楚免得当成已核：
+#   - 退市整理期的**长度**。手上的一手材料是 2022 年一份退市公告，写的是
+#     "十五个交易日"；更早的规则版本是 30 个交易日，具体切换日期我没查到
+#     原文，所以不在代码里写长度常量。
+#   - 深交所是否有同样的 50 万股/日上限。上面这份是**上交所**的办法，
+#     深交所的对应规定我没核，所以 st_daily_buy_cap() 只对 sh. 返回上限。
+
+ST_DAILY_BUY_CAP_SHARES = 500_000     # 上交所：单账户单日买入单只风险警示股
+ST_DAILY_BUY_CAP_FROM = "2013-01-01"
+DELISTING_PERIOD_PCT = 0.10           # 退市整理期，首日除外
+
+
+def st_daily_buy_cap(code, date):
+    """单账户单日买入单只风险警示股票的股数上限；无上限或未核时返回 None。"""
+    if not code.startswith("sh."):
+        return None                    # 深交所对应规定未核，不假设
+    if date < ST_DAILY_BUY_CAP_FROM:
+        return None
+    return ST_DAILY_BUY_CAP_SHARES
+
+
+def delisting_period_limit_pct(is_first_day):
+    """退市整理期的涨跌幅：首日无限制（None），其后 ±10%。"""
+    return None if is_first_day else DELISTING_PERIOD_PCT
 
 # ============================================================
 # 来自 src/audit_formats.py
@@ -200,6 +471,19 @@ def read_trades(path, date_col="date", code_col="code", side_col="side"):
         "code": d[code_col].map(normalize_code),
         "side": d[side_col].astype(str).str.strip().str.lower(),
     })
+    # price 是可选列 —— 有它才能查复权口径，没有就跳过那一项，不猜
+    for cand in ("price", "成交价", "deal_price", "fill_price"):
+        if cand in d.columns:
+            out["price"] = pd.to_numeric(d[cand], errors="coerce")
+            break
+    # qty 同理：有股数才查得了整手/上限，没有就跳过。
+    # **不认 amount／金额**：那是成交额不是股数，混进来会让整手检查全错。
+    # **不认 volume/vol/成交量**：A 股行情里这几个名字既可能是市场总成交量、
+    # 也常以"手"为单位，认错单位会让整手检查 100% 误报。宁可不查。
+    for cand in ("qty", "shares", "quantity", "股数", "成交股数", "委托数量"):
+        if cand in d.columns:
+            out["qty"] = pd.to_numeric(d[cand], errors="coerce")
+            break
     bad = set(out["side"]) - {"buy", "sell"}
     # 常见别名
     alias = {"b": "buy", "s": "sell", "买入": "buy", "卖出": "sell",
@@ -256,17 +540,30 @@ def positions_to_trades(path, date_col="date", code_col="code",
 那些查的是"代码有没有读到未来的值"，与市场无关。这里查的是
 **"A 股这一年的规则是什么，你的回测按的是哪一年的规则"** —— 目前没有工具做这个。
 
-五项检查，每一项都对应本项目真犯过并修好的错：
+十四项检查。绝大多数对应本项目自己真犯过并修好的错 ——
+这不是"我想到可能有坑"的清单，是"我掉进去过"的清单。
 
 | 检查 | 查什么 | 出处 |
 |---|---|---|
-| limit_fill  | 涨停当天算不算买得进、跌停当天算不算卖得出 | 结果 01 |
-| limit_rule  | 涨跌幅是否按**生效日期**取（创业板 2020-08-24 等）| 报告 A7 |
-| stamp_duty  | 印花税是否分段（2023-08-28 减半、2008-09-19 前双边）| 报告 A11 |
-| circuit     | 2016-01-04 / 01-07 熔断日算不算可交易 | 报告 A11 |
-| survivorship| 退市股票在不在样本里 | 面板含 241 只已退市 |
+| limit_fill | 涨停当天算不算买得进、跌停当天算不算卖得出 | 结果 01 |
+| open_limit_fill | 开盘一字板；与上一项**互补，不能相加** | 结果 01 |
+| limit_rule | 涨跌幅是否按**生效日期**取（创业板 2020-08-24 等）| 报告 A7 |
+| stamp_duty | 印花税是否分段（2023-08-28 减半、2008-09-19 前双边）| 报告 A11 |
+| circuit | 2016-01-04 / 01-07 熔断日算不算可交易 | 报告 A11 |
+| t1 | 当日买入当日卖出 | A 股 T+1 |
+| suspension | 停牌日成交 | |
+| held_through_suspension | 持仓穿越停牌期 | 实测复牌日均值 +3.34% |
+| price_convention | 成交价是复权价还是原始价 | |
+| cost_floor | 成本假设是否低于监管费用地板、有没有佣金起点 | |
+| order_size | 整手、单笔申报上限（需 qty 列）| |
+| tick_size | 成交价是否落在 0.01 元上（需 price 列）| |
+| st_buy_cap | 风险警示股单日买入 50 万股上限（需 qty 列）| |
+| survivorship | 退市股票在不在样本里 | 面板含 241 只已退市 |
 
-输入：成交记录 CSV，至少要有 date, code, side（buy/sell）三列，price 可选。
+哪些规则查了、哪些没查、没查的原因，逐条写在发布包的 RULE_INVENTORY.md。
+
+输入：成交记录 CSV，至少要有 date, code, side（buy/sell）三列；
+      price（成交价）与 qty（股数）可选，缺哪列就跳过对应检查并明说"没查"。
 输出：findings 列表，按严重程度分组。
 """
 
@@ -338,6 +635,48 @@ def check_limit_fill(trades, panel):
                       f"{bad_buy + bad_sell} 笔成交发生在封板日（占 {pct:.2%}）"
                       " —— 回测成交了，实盘成交不了，收益被高估",
                       "；".join(ex)))
+    return out
+
+
+def check_open_limit_fill(trades, panel):
+    """按**开盘价**成交时的可成交性 —— 与 `limit_fill`（按收盘）互补。
+
+    很多引擎的口径是"信号次日开盘成交"。开盘一字板同样买不进：集合竞价
+    以涨停价成交，买单排队，轮不到你。跌停开盘则卖不出。
+
+    **本工具无法从成交记录判断对方用的是开盘价还是收盘价**，所以两项都报，
+    让使用者按自己的口径取用。写明这一点，免得两个数被当成重复计数。
+    """
+    out = []
+    need = {"open_limit_up", "open_limit_down"}
+    if not need <= set(panel.columns):
+        return out
+    m = panel.set_index(["date", "code"])
+    bad_buy = bad_sell = 0
+    ex = []
+    for t in trades.itertuples():
+        key = (t.date, t.code)
+        if key not in m.index:
+            continue
+        row = m.loc[key]
+        if t.side == "buy" and bool(row.get("open_limit_up", False)):
+            bad_buy += 1
+            if len(ex) < 5:
+                ex.append(f"{t.date.date()} {t.code} 买入，但当日**开盘**即涨停")
+        if t.side == "sell" and bool(row.get("open_limit_down", False)):
+            bad_sell += 1
+            if len(ex) < 5:
+                ex.append(f"{t.date.date()} {t.code} 卖出，但当日**开盘**即跌停")
+    n = bad_buy + bad_sell
+    if n:
+        pct = n / max(len(trades), 1)
+        out.append(_f("严重" if pct > 0.01 else "中等", "open_limit_fill",
+                      f"{n} 笔成交当日**开盘即封板**（占 {pct:.2%}）—— "
+                      "若你的引擎按开盘价成交，这些成交不存在",
+                      "；".join(ex) +
+                      "／本项与 limit_fill（按收盘价）**互补，不要相加**："
+                      "工具判断不出你用的是开盘还是收盘口径，两项都报，"
+                      "按自己的口径取用。"))
     return out
 
 
@@ -419,6 +758,404 @@ def check_circuit_breaker(trades):
     return out
 
 
+def check_t1(trades):
+    """T+1：当日买入的股票**当日不能卖**。
+
+    这是 A 股与美股最基本的差别之一，也是最容易漏的 —— 通用回测框架
+    （backtrader 等）默认 T+0，拿来跑 A 股时不会有任何提示。
+    影响方向明确：T+0 允许日内来回，回测收益**高估**。
+
+    只查最硬的那条（同日同票既买又卖）。更细的"卖出量超过昨日可用量"
+    需要股数，多数成交记录里没有，所以不在这里查 —— 宁可漏报也不误报。
+    """
+    out = []
+    g = trades.groupby(["date", "code"])["side"].agg(set)
+    both = g[g.apply(lambda x: {"buy", "sell"} <= x)]
+    if len(both):
+        ex = "；".join(f"{d.date()} {c}" for d, c in list(both.index)[:5])
+        out.append(_f("严重", "t1",
+                      f"{len(both)} 个「同一天、同一只票、既买又卖」—— "
+                      "A 股 T+1，当日买入不能当日卖出，回测收益被高估", ex))
+    return out
+
+
+def check_suspension(trades, panel):
+    """在**停牌日**成交 —— 那天根本没有交易。"""
+    out = []
+    if "tradable" not in panel.columns:
+        return out
+    m = panel.set_index(["date", "code"])["tradable"]
+    bad, ex = 0, []
+    for t in trades.itertuples():
+        v = m.get((t.date, t.code))
+        if v is not None and not bool(v):
+            bad += 1
+            if len(ex) < 5:
+                ex.append(f"{t.date.date()} {t.code}")
+    if bad:
+        out.append(_f("严重", "suspension",
+                      f"{bad} 笔成交发生在停牌日（占 {bad / max(len(trades), 1):.2%}）",
+                      "；".join(ex)))
+    return out
+
+
+def check_price_convention(trades, panel):
+    """成交价是**原始价**还是**复权价**。需要 price 列，没有就跳过（不猜）。
+
+    做法：每只票算 `成交价 / 当日原始收盘价` 随时间的变化。
+
+    * 恒等于 1 → 原始价，正确
+    * 随时间跳变 → **复权价**
+
+    **这里只能判到"是复权价"为止，判不出是前复权还是后复权。**
+    第一版写的是"多半来自前复权"，那是过度声称 —— 任何复权序列相对原始价
+    的比值都会在分红日跳变，两种复权在单份成交记录上**不可分辨**。
+    要分辨必须比较**两个不同时间下载的快照**：前复权会改写历史，后复权不会。
+    方法写在 detail 里，留给使用者自己做。
+
+    为什么"是复权价"本身就值得报：按复权价算涨停价、算每手股数、
+    做任何绝对价筛选（如"只买 10 元以下"）都会错 —— 那些规则作用在
+    **真实报价**上，而复权价不是任何一天真实的报价。
+    """
+    out = []
+    if "price" not in trades.columns or "close_raw" not in panel.columns:
+        return out
+    m = panel.set_index(["date", "code"])["close_raw"]
+    ratios = {}
+    for t in trades.itertuples():
+        raw = m.get((t.date, t.code))
+        px = getattr(t, "price", None)
+        if raw is None or not raw or raw <= 0 or px is None or px <= 0:
+            continue
+        ratios.setdefault(t.code, []).append(px / float(raw))
+    multi = {c: v for c, v in ratios.items() if len(v) >= 3}
+    if not multi:
+        return out
+    import statistics as st
+    unadj, adj, worst = 0, 0, None
+    for c, v in multi.items():
+        spread = (max(v) - min(v)) / max(st.mean(v), 1e-12)
+        if all(abs(x - 1.0) < 0.005 for x in v):
+            unadj += 1
+        else:
+            adj += 1
+            if worst is None or spread > worst[1]:
+                worst = (c, spread)
+    n = len(multi)
+    if adj:
+        out.append(_f("中等", "price_convention",
+                      f"{adj}/{n} 只股票的成交价**不是当日原始收盘价** —— 用的是复权价",
+                      f"比值波动最大的是 {worst[0]}（{worst[1]:.1%}）。"
+                      "复权价不是任何一天真实的报价，所以涨停价、每手股数、"
+                      "绝对价筛选都要改用原始价算。"
+                      "／本项无法判断是前复权还是后复权：两者在单份成交记录上"
+                      "不可分辨。要分辨就隔一段时间重新下载一次同一段历史，"
+                      "**前复权的历史值会变，后复权不会** —— 而历史会变的回测"
+                      "无法复现，这比算错更麻烦。"))
+    return out
+
+
+def check_held_through_suspension(trades, panel):
+    """**持仓穿越停牌** —— 比"在停牌日成交"常见得多，量级也更大。
+
+    `check_suspension` 查的是成交日本身停牌（罕见，多数引擎会跳过）。
+    这里查的是更常见的那种：**买入之后停牌，停牌期间账面照常算收益**。
+
+    为什么这是问题：停牌往往伴随重大事项，复牌当天经常大幅跳空，而回测里
+    停牌那段通常按最后价格平着走。
+
+    **方向不预设。** 我第一版在这里写死了"利空停牌尤其，风险被删掉、收益被
+    留下"，然后跑真实数据：复牌首日收益均值 **+3.34%**、中位数 +5.01% ——
+    是正的。原因大概是 A 股停牌相当一部分是重大资产重组，复牌常连板。
+    所以"高估收益"这个方向在那个样本上不成立，写死方向是错的。
+
+    **确定成立的是另一件事，与方向无关**：停牌那段你**既不能卖也不能止损**。
+    回测里任何止损、风控、调仓规则在那个窗口都是虚构的，而跳空的全部幅度
+    （无论正负）你都必须照单全收。所以这里只报实测的分布，让数据说方向。
+
+    做法：按成交记录还原每只票的持有区间（买 → 持有，卖 → 空仓），
+    数区间内 `tradable == False` 的天数；若面板带收盘价，再算**复牌首日**
+    的收益分布 —— 那才是被抹掉的东西的大小。
+    """
+    out = []
+    if "tradable" not in panel.columns:
+        return out
+    pan = panel.sort_values(["code", "date"])
+    by_code = {c: g for c, g in pan.groupby("code", observed=True)}
+    has_px = "close_raw" in panel.columns
+
+    episodes, total_days, gaps = 0, 0, []
+    affected = set()
+    for code, g in trades.sort_values("date").groupby("code", observed=True):
+        p = by_code.get(code)
+        if p is None or p.empty:
+            continue
+        held_from = None
+        spans = []
+        for t in g.itertuples():
+            if t.side == "buy" and held_from is None:
+                held_from = t.date
+            elif t.side == "sell" and held_from is not None:
+                spans.append((held_from, t.date))
+                held_from = None
+        if held_from is not None:                 # 还没卖出的，算到样本末
+            spans.append((held_from, p["date"].max()))
+        for a, b in spans:
+            w = p[(p["date"] > a) & (p["date"] < b)]
+            if w.empty:
+                continue
+            tr = w["tradable"].to_numpy(dtype=bool)
+            if tr.all():
+                continue
+            affected.add(code)
+            total_days += int((~tr).sum())
+            # 停牌段的边界：False 转 True 的那一天就是复牌首日
+            idx = w.index.to_numpy()
+            for i in range(1, len(tr)):
+                if tr[i] and not tr[i - 1]:
+                    episodes += 1
+                    if has_px and i >= 1:
+                        prev = w.iloc[:i]
+                        last_px = prev.loc[prev["tradable"].to_numpy(dtype=bool),
+                                           "close_raw"]
+                        if len(last_px):
+                            px0 = float(last_px.iloc[-1])
+                            px1 = float(w.iloc[i]["close_raw"])
+                            if px0 > 0:
+                                gaps.append(px1 / px0 - 1)
+    if not affected:
+        return out
+    detail = (f"涉及 {len(affected)} 只股票，停牌日合计 {total_days} 个交易日，"
+              f"复牌 {episodes} 次。")
+    if gaps:
+        import statistics as st
+        mu, lo, hi = st.mean(gaps), min(gaps), max(gaps)
+        detail += (f"／**复牌首日收益**：均值 {mu:+.2%}，"
+                   f"中位数 {st.median(gaps):+.2%}，"
+                   f"区间 [{lo:+.2%}, {hi:+.2%}]。"
+                   f"这段跳空在回测里多半被抹成了平的 —— 按本样本，"
+                   f"抹掉的方向是"
+                   + ("**高估**" if mu < 0 else "**低估**") +
+                   f"收益约 {abs(mu):.2%}／次；"
+                   "但无论正负，停牌期间你既不能卖也不能止损，"
+                   "回测里那段时间的止损与风控规则都是虚构的。")
+    else:
+        detail += "（面板没有收盘价列，算不出复牌首日跳空的大小。）"
+    out.append(_f("严重", "held_through_suspension",
+                  f"{episodes} 段持仓穿越了停牌期 —— 那段时间账面在算收益，"
+                  "而实际既不能卖也不能止损", detail))
+    return out
+
+
+def check_cost_floor(trades, assumed_bps=None, assumed_min_commission=None):
+    """成本地板：监管类费用（过户费 + 经手费 + 证管费 + 印花税）不可避免。
+
+    多数回测只算佣金和印花税，漏掉过户费/经手费/证管费 —— 三项双边合计约
+    0.0064%，一轮买卖约 1.3bp。单看不大，高换手策略上会累积。
+
+    另一项更狠的是**佣金起点 5 元**：10,000 元的单子按万 2.5 只有 2.5 元，
+    实际收 5 元，费率翻倍；5,000 元的单子是名义的 4 倍。
+    回测用固定 bps 时，资金越小、单笔越小，低估得越厉害。
+    """
+    out = []
+    if not len(trades):
+        return out
+    d0, d1 = trades["date"].min(), trades["date"].max()
+    lo = regulatory_cost_rate(str(d0.date()), "buy")
+    hi = regulatory_cost_rate(str(d1.date()), "sell")
+    detail = (f"监管类费用地板（不含佣金）：买入约 {lo:.4%}、"
+              f"卖出约 {hi:.4%}／构成：过户费 0.001% 双边、"
+              "经手费 0.0341‰ 双边、证管费 0.02‰ 双边、印花税按日期分段。"
+              "来源为券商官方费用公示，**只覆盖当前档，历史沿革未核**。")
+    if assumed_bps is not None:
+        floor_bps = (lo + hi) * 1e4
+        if assumed_bps < floor_bps:
+            out.append(_f("中等", "cost_floor",
+                          f"你假设的一轮买卖成本 {assumed_bps:.2f}bp "
+                          f"低于监管类费用地板 {floor_bps:.2f}bp（还没算佣金）",
+                          detail))
+    if assumed_min_commission is not None and assumed_min_commission <= 0:
+        out.append(_f("中等", "cost_floor",
+                      f"你的成本模型没有**佣金起点**（券商普遍 "
+                      f"{MIN_COMMISSION_YUAN:.0f} 元/笔）",
+                      "小额交易上这一项能让实际费率翻倍甚至更多："
+                      "10,000 元按万 2.5 名义 2.5 元、实收 5 元；"
+                      "5,000 元的单子实际费率是名义的 4 倍。"
+                      "资金越小、单笔越小，回测低估得越厉害。"))
+    return out
+
+
+def check_order_size(trades, order_type="limit"):
+    """整手约束与单笔申报上限。只在成交记录带**股数**时能查。
+
+    出处：上交所交易规则 3.3.8/3.3.9、深交所交易规则 3.3.8/3.3.10、
+    科创板交易特别规定第二十条、深交所创业板交易特别规定 2.8。
+    条款号都在 ashare_rules 里，沪深主板各引各自的条款。
+
+    为什么这条重要：按权重回测的策略，落到实盘要取整。一只 300 元的股票
+    一手就是 3 万元，小资金账户上"买 0.4% 仓位"根本报不进去 —— 回测里
+    那笔成交是凭空来的。反过来，大资金会撞上单笔申报上限，一笔变多笔、
+    冲击成本上升，回测同样看不见。
+
+    三个刻意的边界，免得被当成查全了：
+
+    1. **默认按限价单的上限判**（order_type='limit'）。市价单的上限更低
+       （创业板 15 万、科创板 5 万），但成交记录里通常看不出委托类型。
+       限价档是两者中更宽的一档，所以默认口径**只会漏报、不会误报**。
+       知道自己跑的是市价单，传 order_type='market'。
+    2. **卖出侧只查上限、不查整手**：零股必须一次性卖出，"卖 37 股"合法。
+       代价是"持仓 5000 股卖 150 股"这种违规查不出来 —— 审计器看不到持仓。
+    3. **北交所不判**：申报数量规则没核到原文，单独计数并提示，不算通过。
+    """
+    out = []
+    if not len(trades):
+        return out
+    if "qty" not in trades.columns:
+        out.append(_f("轻微", "order_size",
+                      "成交记录里没有股数列，整手约束与单笔上限**没查**",
+                      "按权重输出的回测普遍如此。想查这一项，"
+                      "在成交明细里加一列 qty（股数）再跑一次。"
+                      "取整这件事在小资金上很致命：一只 300 元的股票"
+                      "一手 3 万元，小账户上小额仓位根本报不进去。"))
+        return out
+    q = trades[["code", "side", "qty"]].dropna(subset=["qty"])
+    if not len(q):
+        out.append(_f("轻微", "order_size", "股数列全为空值，这一项没查"))
+        return out
+    bad, unjudged = {}, {}
+    for code, side, n in q.itertuples(index=False):
+        sd = str(side).strip().lower()
+        if sd not in ("buy", "sell"):
+            unjudged.setdefault(f"买卖方向无法识别（{side!r}）", []).append((code, n))
+            continue
+        ok, why = order_shares_ok(code, n, sd, order_type)
+        if ok is None:
+            unjudged.setdefault(why, []).append((code, n))
+        elif not ok:
+            bad.setdefault(why, []).append((code, sd, n))
+    frac = sum(len(v) for v in bad.values()) / len(q)
+    for why, rows in sorted(bad.items(), key=lambda kv: -len(kv[1])):
+        code, sd, n = rows[0]
+        out.append(_f("中等" if len(rows) / len(q) > 0.01 else "轻微",
+                      "order_size",
+                      f"{len(rows)} 笔成交：{why}",
+                      f"例：{code} {sd} {float(n):,.0f} 股。"
+                      f"整体 {frac:.2%} 的成交报不进交易所"
+                      f"（按 {order_type} 口径）。"))
+    for why, rows in sorted(unjudged.items(), key=lambda kv: -len(kv[1])):
+        out.append(_f("轻微", "order_size",
+                      f"{len(rows)} 笔成交**没判**：{why}",
+                      f"例：{rows[0][0]}。没判不等于合规 —— "
+                      "规则核不到原文的板块，这里不猜。"))
+    return out
+
+
+def _as_bool(sr):
+    """把面板里的 is_st 稳健地变成 bool。
+
+    直接 .astype(bool) 会把字符串 "False" 当成 True（非空字符串为真），
+    object dtype 上 fillna 还会触发 pandas 的 downcasting FutureWarning。
+    这是代码审查抓出来的：一份 is_st 存成字符串的面板会让 ST 检查大面积误报。
+    """
+    if sr.dtype == bool:
+        return sr
+    if sr.dtype == object or str(sr.dtype).startswith("string"):
+        m = {"true": True, "1": True, "1.0": True, "y": True, "yes": True,
+             "是": True, "t": True,
+             "false": False, "0": False, "0.0": False, "n": False, "no": False,
+             "否": False, "f": False, "": False, "nan": False, "none": False}
+        return sr.map(lambda x: False if (x is None or x != x)
+                      else m.get(str(x).strip().lower(), bool(x))).astype(bool)
+    return sr.fillna(0).astype(float).ne(0)
+
+
+def check_st_buy_cap(trades, panel):
+    """风险警示股票：单账户单日买入单只不超过 50 万股。
+
+    出处：上交所《风险警示板股票交易管理办法》第十四条（2013-01-01 起）。
+    深交所的对应规定我没核，所以这里只查沪市代码 —— 少查是保守，
+    照着沪市往深市套才是编规则。
+
+    这条和整手一样只在有股数时能查，但它比整手更容易吃到：ST 股价低，
+    50 万股在很多 ST 上只有两三百万元 —— 一个几千万的账户想在 ST 上
+    建 5% 仓位，一天报不进去。回测里那笔成交是不存在的。
+    """
+    out = []
+    if not len(trades) or "qty" not in trades.columns:
+        return out
+    if "is_st" not in panel.columns:
+        return out
+    st = panel.loc[_as_bool(panel["is_st"]), ["date", "code"]].copy()
+    if not len(st):
+        return out
+    st["date"] = pd.to_datetime(st["date"]).dt.normalize()
+    # 面板可能有重复行（拼接过的、带多层索引的）。不去重，merge 会把
+    # 一笔合法成交复制成两笔再求和，凭空造出一个"超限"。
+    st = st.drop_duplicates()
+    b = trades[(trades["side"].astype(str).str.strip().str.lower() == "buy")
+               & trades["qty"].notna()].copy()
+    if not len(b):
+        return out
+    b["qty"] = pd.to_numeric(b["qty"], errors="coerce")
+    b = b[b["qty"].notna()]
+    if not len(b):
+        return out
+    # 成交记录常带时分秒，面板是午夜 —— 不归一化，merge 命中 0 行，
+    # 这条检查会在真实输入上静默失效（代码审查抓出来的）。
+    b["date"] = pd.to_datetime(b["date"]).dt.normalize()
+    # 同一天同一只的买入要**累加**再比上限 —— 规则写的是"累计买入"，
+    # 逐笔比会漏掉拆单。
+    agg = (b.merge(st, on=["date", "code"], how="inner")
+             .groupby(["date", "code"], as_index=False)["qty"].sum())
+    if not len(agg):
+        return out
+    hits = []
+    for dt, code, q in agg.itertuples(index=False):
+        cap = st_daily_buy_cap(code, str(pd.Timestamp(dt).date()))
+        if cap is not None and q > cap:
+            hits.append((dt, code, q, cap))
+    if not hits:
+        return out
+    dt, code, q, cap = max(hits, key=lambda x: x[2])
+    out.append(_f("中等", "st_buy_cap",
+                  f"{len(hits)} 个交易日的 ST 买入超过单日 50 万股上限",
+                  f"最大的一笔：{code} {pd.Timestamp(dt).date()} 买入 "
+                  f"{q:,.0f} 股，上限 {cap:,} 股。"
+                  "规则按「当日累计」算，拆单不管用。"
+                  "只查了沪市代码 —— 深交所的对应规定未核，不假设。"))
+    return out
+
+
+def check_tick_size(trades):
+    """申报价格最小变动单位 0.01 元。只在成交记录带价格时能查。
+
+    出处：上交所交易规则 3.3.11（A 股 0.01 元）。
+
+    回测里常见的是"按当日均价成交"或"按 VWAP 成交"，这类价格几乎都不落在
+    分上。成交价不在最小变动单位上，说明那个价格在市场上并不存在。
+    它本身不一定是错（均价是合理近似），但**它是在告诉你回测用的不是
+    真实可成交价**，滑点假设要从这里重新算。
+    """
+    out = []
+    if not len(trades) or "price" not in trades.columns:
+        return out
+    p = trades["price"].dropna()
+    p = p[p > 0]
+    if not len(p):
+        return out
+    off = p[~p.map(price_on_tick)]
+    if not len(off):
+        return out
+    frac = len(off) / len(p)
+    out.append(_f("中等" if frac > 0.5 else "轻微", "tick_size",
+                  f"{len(off)} 笔（{frac:.1%}）成交价不落在 0.01 元的"
+                  "最小变动单位上",
+                  f"例：{off.iloc[0]:.6f}。这种价格在市场上不存在，"
+                  "通常意味着你成交在均价/VWAP 上而不是可申报价上 —— "
+                  "不一定是错，但滑点假设得按这个重新算。"))
+    return out
+
+
 def check_survivorship(trades, panel):
     """样本里一只退市股都没有 → 几乎一定是幸存者偏差。"""
     out = []
@@ -440,19 +1177,95 @@ def check_survivorship(trades, panel):
     return out
 
 
-def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None):
+def expected_max_sharpe(n_trials, sd, mean=0.0):
+    """N 次独立试验下，**零技能**假设中最大 Sharpe 的期望。
+
+        E[max] ≈ μ + σ·[(1-γ)Φ⁻¹(1-1/N) + γ·Φ⁻¹(1-1/(N·e))]
+
+    γ 是 Euler–Mascheroni 常数。这是极值分布的标准近似（Bailey & López de
+    Prado 在 Deflated Sharpe Ratio 里用的同一个式子）。
+
+    它回答的问题是：**如果我完全没有技能，光靠试 N 次，能挑出多高的 Sharpe？**
+    只有超过这个数的部分才可能是技能。
+
+    这一项**不是 A 股特有**的 —— 但它是本工具其余七项加起来都比不上的那一个。
+    一份回测哪怕制度规则全对，只要作者试了 200 个策略只报最好的那个，
+    报出来的数字就仍然主要是选择的产物。
+    """
+    from statistics import NormalDist
+    if n_trials < 2:
+        raise ValueError("试验次数至少 2 次")
+    if sd <= 0:
+        raise ValueError("试验间 Sharpe 的标准差必须为正")
+    g, nd, e = 0.5772156649015329, NormalDist(), 2.718281828459045
+    return mean + sd * ((1 - g) * nd.inv_cdf(1 - 1 / n_trials)
+                        + g * nd.inv_cdf(1 - 1 / (n_trials * e)))
+
+
+def report_trials(n_trials, observed, sd, mean):
+    emax = expected_max_sharpe(n_trials, sd, mean)
+    print(f"试验 {n_trials} 次，试验间 Sharpe 均值 {mean:.3f}、标准差 {sd:.3f}\n")
+    print(f"  **零技能**假设下，最大 Sharpe 的期望：{emax:.2f}")
+    if observed is not None:
+        gap = observed - emax
+        print(f"  你报告的 Sharpe：{observed:.2f}   差额：{gap:+.2f}")
+        if gap <= 0:
+            print("\n  → 报告的 Sharpe **没有超过**零技能下的期望最大值。"
+                  "\n    这个数字可以完全由试验次数解释，不构成技能的证据。")
+        elif gap < 0.5 * sd:
+            print("\n  → 只高出不到半个试验间标准差。**大部分**可以由试验次数解释。")
+        else:
+            print("\n  → 高出零技能期望，但这不等于显著 —— 还要看样本长度、"
+                  "\n    收益的偏度与峰度。完整的 Deflated Sharpe Ratio 需要这些。")
+    print("\n  试验次数的代价：")
+    for n in (5, 10, 20, 50, 100, 200, 500):
+        print(f"    {n:>4d} 次 → {expected_max_sharpe(n, sd, mean):.2f}")
+    print("\n  两条边界：")
+    print("  1. 本式假设 N 次试验**相互独立**。若你的策略是同一想法的变体"
+          "（换窗口、换参数），\n     实际独立试验数远小于 N，真实期望最大值更低 —— "
+          "所以这里算的是**上界**。")
+    print("  2. 试验次数要算**全部**跑过的，不只是留下的那些。"
+          "\n     调参试过的、跑完看一眼就删的，全都算。")
+
+
+def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None,
+        assumed_cost_bps=None, assumed_min_commission=None,
+        order_type="limit"):
     f = []
     f += check_limit_fill(trades, panel)
+    f += check_open_limit_fill(trades, panel)
     f += check_limit_rule(trades, assumed_limit_pct)
     f += check_stamp_duty(trades, assumed_stamp_bps)
     f += check_circuit_breaker(trades)
+    f += check_t1(trades)
+    f += check_suspension(trades, panel)
+    f += check_price_convention(trades, panel)
+    f += check_held_through_suspension(trades, panel)
+    f += check_cost_floor(trades, assumed_cost_bps, assumed_min_commission)
+    f += check_order_size(trades, order_type)
+    f += check_tick_size(trades)
+    f += check_st_buy_cap(trades, panel)
     f += check_survivorship(trades, panel)
     return sorted(f, key=lambda x: SEV.index(x["severity"]))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="A 股回测的制度规则审计")
-    ap.add_argument("trades", help="成交记录 CSV：date, code, side[, price]")
+    ap.add_argument("trades", nargs="?",
+                    help="成交记录 CSV：date, code, side[, price]")
+    ap.add_argument("--trials", type=int, default=None,
+                    help="多重检验模式：一共跑过多少次回测/策略")
+    ap.add_argument("--observed-sharpe", type=float, default=None,
+                    help="你最终报告的那个 Sharpe")
+    ap.add_argument("--trial-sharpes", default=None,
+                    help="逗号分隔的各次试验 Sharpe，用来估均值与标准差")
+    ap.add_argument("--trial-sharpe-sd", type=float, default=None,
+                    help="试验间 Sharpe 的标准差（没有 --trial-sharpes 时用）")
+    ap.add_argument("--trial-sharpe-mean", type=float, default=0.0)
+    ap.add_argument("--assumed-cost-bps", type=float, default=None,
+                    help="你的成本模型里一轮买卖合计多少 bp")
+    ap.add_argument("--assumed-min-commission", type=float, default=None,
+                    help="你的成本模型里的佣金起点（元）；传 0 表示没有")
     ap.add_argument("--panel", default="data/panel.parquet",
                     help="对照面板 parquet，需含 date/code/limit_up/limit_down/is_st 列")
     ap.add_argument("--assumed-limit-pct", type=float, default=None,
@@ -461,6 +1274,9 @@ def main(argv=None):
                     help="被审回测假设的印花税，如 5")
     ap.add_argument("--framework", choices=sorted(FRAMEWORK_PROFILES),
                     help="直接套用某框架的默认假设")
+    ap.add_argument("--order-type", choices=("limit", "market"), default="limit",
+                    help="委托类型，决定按哪一档单笔上限判（默认 limit，"
+                         "是更宽的一档，只会漏报不会误报）")
     ap.add_argument("--positions", action="store_true",
                     help="输入是逐日持仓表而非成交明细，由 0↔非0 跃迁推成交")
     ap.add_argument("--date-col", default="date")
@@ -478,18 +1294,41 @@ def main(argv=None):
             a.assumed_stamp_bps = prof["stamp_bps"]
         print(f"框架档案 {a.framework}：{prof['note']}\n")
 
+    if a.trials is not None:
+        if a.trial_sharpes:
+            import statistics as _st
+            v = [float(x) for x in a.trial_sharpes.split(",") if x.strip()]
+            if len(v) < 2:
+                raise SystemExit("--trial-sharpes 至少给 2 个值")
+            mean, sd = _st.mean(v), _st.stdev(v)
+            print(f"（标准差来自你给的 {len(v)} 个试验 Sharpe"
+                  f"{'，注意这是全部 %d 次里的一部分' % a.trials if len(v) < a.trials else ''}）\n")
+        elif a.trial_sharpe_sd:
+            mean, sd = a.trial_sharpe_mean, a.trial_sharpe_sd
+        else:
+            raise SystemExit("需要 --trial-sharpes 或 --trial-sharpe-sd 之一"
+                             " —— 没有试验间的离散程度就算不出期望最大值")
+        report_trials(a.trials, a.observed_sharpe, sd, mean)
+        return
+    if not a.trades:
+        raise SystemExit("要么给成交记录 CSV，要么用 --trials 走多重检验模式")
+
     if a.positions:
         tr = positions_to_trades(a.trades, a.date_col, a.code_col, a.qty_col)
         print(f"由持仓表推出 {len(tr)} 笔成交（只取 0↔非0 的跃迁）\n")
     else:
         tr = read_trades(a.trades, a.date_col, a.code_col, a.side_col)
-    pan = pd.read_parquet(a.panel, columns=["date", "code", "limit_up",
-                                            "limit_down", "is_st"])
-    fs = run(tr, pan, a.assumed_limit_pct, a.assumed_stamp_bps)
+    want = ["date", "code", "limit_up", "limit_down", "is_st", "tradable",
+            "close_raw", "open_limit_up", "open_limit_down"]
+    import pyarrow.parquet as _pq
+    have = set(_pq.ParquetFile(a.panel).schema_arrow.names)
+    pan = pd.read_parquet(a.panel, columns=[c for c in want if c in have])
+    fs = run(tr, pan, a.assumed_limit_pct, a.assumed_stamp_bps,
+             a.assumed_cost_bps, a.assumed_min_commission, a.order_type)
     print(f"审计 {len(tr)} 笔成交，{tr['code'].nunique()} 只股票，"
           f"{tr['date'].min().date()} ~ {tr['date'].max().date()}\n")
     if not fs:
-        print("未发现问题。（注意：未发现不等于没有 —— 本工具只查这五项）")
+        print("未发现问题。（注意：未发现不等于没有 —— 本工具只查\n      RULE_INVENTORY.md 里标了 ✅/◐ 的那些项，标 ○ 和 ✗ 的一概没查）")
         return
     cur = None
     for x in fs:
