@@ -381,6 +381,51 @@ def delisting_period_limit_pct(is_first_day):
     """退市整理期的涨跌幅：首日无限制（None），其后 ±10%。"""
     return None if is_first_day else DELISTING_PERIOD_PCT
 
+
+# ---------- 卖空：A 股卖不出手里没有的票 ----------
+#
+# 出处（一手）：《上海证券交易所融资融券交易实施细则（2023 年修订）》
+#   第二条 融券交易是"借入证券并卖出"的行为 —— 先借到券，才能卖
+#   第二十三条、第三十条 只能融券卖出交易所公布的**标的证券名单**内的证券，
+#           会员向客户公布的名单不得超出本所范围
+#   第十二条 **融券卖出的申报价格不得低于该证券的最新成交价**；
+#           当天没有成交的，不得低于前收盘价（即"提价规则"）
+#
+# 对回测的意义，这一条被忽略的程度和涨跌停差不多：
+#   1. **裸卖空在 A 股不存在。** 卖出一只手里没有的票，在 A 股是报不进去的
+#      委托，不是"成本高一点"的交易。多空对冲、截面做空的回测如果直接对
+#      因子低分组下空单，那半边收益整个是不存在的。
+#   2. 走融券也有三道门：标的名单、券源（有没有票可借）、以及提价规则 ——
+#      提价规则意味着**下跌途中你往往卖不出去**，恰恰是最想做空的时候。
+#
+# 券源和标的名单是逐日变化的数据，免费数据源拿不到，所以审计器只查第 1 条
+# （手里没有的票不能卖），查得到就是硬伤；查不到的那两条写在 RULE_INVENTORY。
+
+SHORT_UPTICK_RULE = True         # 融券卖出不得低于最新成交价
+
+
+# ---------- 投资者适当性：板块权限 ----------
+#
+# 出处：上交所科创板投资者适当性材料（个人投资者：申请权限开通前 20 个交易日
+# 证券账户及资金账户内资产**日均不低于 50 万元**，且**参与证券交易 24 个月
+# 以上**）；北交所同为 50 万 + 24 个月；深交所创业板为 10 万 + 24 个月。
+#
+# 创业板那一档针对注册制改革后**新开通**权限的投资者，改革前已开通的不受影响 ——
+# 具体生效日我没核到原文，所以这里不写日期常量，只写门槛。
+#
+# 为什么审计器要管这个：策略池里有科创板，就等于假设账户有科创板权限，
+# 也就等于假设账户资产曾经 20 个交易日日均 50 万以上。用 10 万本金回测
+# 一个含科创板的策略，前提本身不成立 —— 这不是成本问题，是权限问题。
+
+BOARD_ACCESS_THRESHOLD_YUAN = {"主板": 0, "创业板": 100_000,
+                               "科创板": 500_000, "北交所": 500_000}
+BOARD_ACCESS_MONTHS = 24
+
+
+def board_access_threshold(code):
+    """交易该板块所需的账户资产门槛（元，20 个交易日日均）。"""
+    return BOARD_ACCESS_THRESHOLD_YUAN[board(code)]
+
 # ============================================================
 # 来自 src/audit_formats.py
 # ============================================================
@@ -540,7 +585,7 @@ def positions_to_trades(path, date_col="date", code_col="code",
 那些查的是"代码有没有读到未来的值"，与市场无关。这里查的是
 **"A 股这一年的规则是什么，你的回测按的是哪一年的规则"** —— 目前没有工具做这个。
 
-十四项检查。绝大多数对应本项目自己真犯过并修好的错 ——
+十六项检查。绝大多数对应本项目自己真犯过并修好的错 ——
 这不是"我想到可能有坑"的清单，是"我掉进去过"的清单。
 
 | 检查 | 查什么 | 出处 |
@@ -558,6 +603,8 @@ def positions_to_trades(path, date_col="date", code_col="code",
 | order_size | 整手、单笔申报上限（需 qty 列）| |
 | tick_size | 成交价是否落在 0.01 元上（需 price 列）| |
 | st_buy_cap | 风险警示股单日买入 50 万股上限（需 qty 列）| |
+| naked_short | 卖出手里没有的票 —— **A 股裸卖空不存在** | |
+| board_permission | 科创板/北交所需 50 万、创业板 10 万的账户权限门槛 | |
 | survivorship | 退市股票在不在样本里 | 面板含 241 只已退市 |
 
 哪些规则查了、哪些没查、没查的原因，逐条写在发布包的 RULE_INVENTORY.md。
@@ -1156,6 +1203,118 @@ def check_tick_size(trades):
     return out
 
 
+def check_naked_short(trades):
+    """A 股卖不出手里没有的票。
+
+    出处：上交所融资融券交易实施细则第二条（融券是"借入证券并卖出"）、
+    第二十三条/第三十条（只能卖标的名单内的券）、第十二条（融券卖出申报价
+    不得低于最新成交价，即提价规则）。
+
+    这一条被忽略的程度和涨跌停差不多：**裸卖空在 A 股不存在**。卖出一只
+    手里没有的票，是报不进去的委托，不是"成本高一点"的交易。多空对冲、
+    截面做空的回测如果直接对因子低分组下空单，那半边收益整个是不存在的。
+
+    查法：沿时间轴累计每只票的仓位，出现"卖出后仓位为负"就是不可能的成交。
+    有 qty 列时按股数算，没有就按"这只票之前有没有买过"算。
+
+    **一个必须说清的替代解释**：成交记录如果从策略中途截起，起点之前的持仓
+    看不见，那么开头几笔卖出会被误判。所以这里把"最早的卖出发生在任何买入
+    之前"和"中途卖穿"分开报，前者标轻微并写明这个可能。
+    """
+    out = []
+    if not len(trades):
+        return out
+    d = trades.sort_values("date", kind="mergesort")
+    has_q = "qty" in d.columns
+    pos, first_buy = {}, {}
+    naked_mid, naked_head = [], []
+    for row in d.itertuples(index=False):
+        code = row.code
+        side = str(row.side).strip().lower()
+        if side not in ("buy", "sell"):
+            continue
+        q = 1.0
+        if has_q:
+            try:
+                q = abs(float(row.qty))
+            except (TypeError, ValueError):
+                q = 1.0
+            if q != q or q in (float("inf"), float("-inf")):
+                q = 1.0
+        if side == "buy":
+            pos[code] = pos.get(code, 0.0) + q
+            first_buy.setdefault(code, row.date)
+        else:
+            have = pos.get(code, 0.0)
+            if have <= 0:
+                (naked_mid if code in first_buy else naked_head).append(
+                    (row.date, code, q, have))
+            pos[code] = have - q
+    n_sell = int((d["side"].astype(str).str.strip().str.lower() == "sell").sum())
+    if naked_mid:
+        dt, code, q, have = naked_mid[0]
+        out.append(_f("严重", "naked_short",
+                      f"{len(naked_mid)} 笔卖出发生在仓位已经清零之后 —— "
+                      "A 股卖不出手里没有的票",
+                      f"例：{code} {pd.Timestamp(dt).date()} 卖出时账上仓位 "
+                      f"{have:g}。裸卖空在 A 股是报不进去的委托，"
+                      "不是成本高一点的交易。走融券还有三道门：标的名单、券源、"
+                      "以及提价规则（申报价不得低于最新成交价）—— "
+                      "提价规则意味着下跌途中往往卖不出去，"
+                      "恰恰是最想做空的时候。"))
+    if naked_head:
+        dt, code, q, have = naked_head[0]
+        out.append(_f("轻微", "naked_short",
+                      f"{len(naked_head)} 笔卖出在这份记录里找不到对应的买入",
+                      f"例：{code} {pd.Timestamp(dt).date()}。"
+                      f"占全部卖出的 {len(naked_head) / max(n_sell, 1):.1%}。"
+                      "两种可能：成交记录从策略中途截起、起点前的持仓看不见"
+                      "（那就没问题）；或者策略真的在下空单（那半边收益"
+                      "在 A 股不存在）。自己确认是哪一种。"))
+    return out
+
+
+def check_board_permission(trades, capital_yuan=None):
+    """板块权限：交易科创板/北交所，等于假设账户资产曾达 50 万。
+
+    出处：上交所科创板投资者适当性（个人：申请权限开通前 20 个交易日证券
+    账户及资金账户内资产**日均不低于 50 万元**，且**参与证券交易 24 个月
+    以上**）；北交所同为 50 万 + 24 个月；深交所创业板 10 万 + 24 个月。
+
+    为什么这算制度坑：用 10 万本金回测一个含科创板的策略，前提本身不成立 ——
+    不是成本问题，是权限问题。传 capital_yuan 才判，不传只列出涉及的板块。
+    """
+    out = []
+    if not len(trades):
+        return out
+    boards = {}
+    for code in trades["code"].unique():
+        boards.setdefault(board(code), []).append(code)
+    need = {b: board_access_threshold(codes[0]) for b, codes in boards.items()}
+    need = {b: v for b, v in need.items() if v > 0}
+    if not need:
+        return out
+    worst = max(need.values())
+    listing = "、".join(f"{b}（{need[b]:,} 元）"
+                       for b in sorted(need, key=lambda x: -need[x]))
+    if capital_yuan is None:
+        out.append(_f("轻微", "board_permission",
+                      f"策略池涉及有权限门槛的板块：{listing}",
+                      "门槛是「申请权限开通前 20 个交易日日均资产」，"
+                      f"另需参与证券交易 {BOARD_ACCESS_MONTHS} 个月以上。"
+                      "传 --capital 让我核一下你的本金够不够开这些权限。"))
+        return out
+    if capital_yuan < worst:
+        out.append(_f("中等", "board_permission",
+                      f"本金 {capital_yuan:,.0f} 元低于交易这些板块所需的"
+                      f"权限门槛 {worst:,} 元",
+                      f"涉及：{listing}。门槛是「申请权限开通前 20 个交易日"
+                      "日均资产」，不是「现在有多少钱」，另需参与证券交易 "
+                      f"{BOARD_ACCESS_MONTHS} 个月以上。"
+                      "这不是成本问题，是这个账户根本下不了这些单。"))
+    return out
+
+
 def check_survivorship(trades, panel):
     """样本里一只退市股都没有 → 几乎一定是幸存者偏差。"""
     out = []
@@ -1230,7 +1389,7 @@ def report_trials(n_trials, observed, sd, mean):
 
 def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None,
         assumed_cost_bps=None, assumed_min_commission=None,
-        order_type="limit"):
+        order_type="limit", capital_yuan=None):
     f = []
     f += check_limit_fill(trades, panel)
     f += check_open_limit_fill(trades, panel)
@@ -1245,6 +1404,8 @@ def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None,
     f += check_order_size(trades, order_type)
     f += check_tick_size(trades)
     f += check_st_buy_cap(trades, panel)
+    f += check_naked_short(trades)
+    f += check_board_permission(trades, capital_yuan)
     f += check_survivorship(trades, panel)
     return sorted(f, key=lambda x: SEV.index(x["severity"]))
 
@@ -1274,6 +1435,9 @@ def main(argv=None):
                     help="被审回测假设的印花税，如 5")
     ap.add_argument("--framework", choices=sorted(FRAMEWORK_PROFILES),
                     help="直接套用某框架的默认假设")
+    ap.add_argument("--capital", type=float, default=None,
+                    help="回测本金（元），用来核板块权限门槛（科创板/北交所"
+                         "50 万、创业板 10 万）")
     ap.add_argument("--order-type", choices=("limit", "market"), default="limit",
                     help="委托类型，决定按哪一档单笔上限判（默认 limit，"
                          "是更宽的一档，只会漏报不会误报）")
@@ -1324,7 +1488,8 @@ def main(argv=None):
     have = set(_pq.ParquetFile(a.panel).schema_arrow.names)
     pan = pd.read_parquet(a.panel, columns=[c for c in want if c in have])
     fs = run(tr, pan, a.assumed_limit_pct, a.assumed_stamp_bps,
-             a.assumed_cost_bps, a.assumed_min_commission, a.order_type)
+             a.assumed_cost_bps, a.assumed_min_commission, a.order_type,
+             a.capital)
     print(f"审计 {len(tr)} 笔成交，{tr['code'].nunique()} 只股票，"
           f"{tr['date'].min().date()} ~ {tr['date'].max().date()}\n")
     if not fs:
