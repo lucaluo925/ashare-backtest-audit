@@ -98,7 +98,10 @@ def build(codes, start, end, out):
     p["limit_up"] = (p["close"] - up).abs() <= TOL
     p["limit_down"] = (p["close"] - dn).abs() <= TOL
 
-    cols = ["date", "code", "limit_up", "limit_down", "is_st", "tradable"]
+    # close_raw 用来算复牌首日的跳空幅度（held_through_suspension 检查）
+    p["close_raw"] = p["close"]
+    cols = ["date", "code", "limit_up", "limit_down", "is_st", "tradable",
+            "close_raw"]
     p[cols].to_parquet(out, index=False)
     print(f"→ {out}  {len(p):,} 行  "
           f"封涨停 {int(p['limit_up'].sum()):,}  封跌停 {int(p['limit_down'].sum()):,}")

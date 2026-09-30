@@ -31,7 +31,7 @@ python3 ashare_audit_standalone.py 你的成交.csv --panel panel.parquet
 python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --panel panel.parquet
 ```
 
-## 它查什么（八项）
+## 它查什么（九项）
 
 | 检查 | 问题 | 为什么重要 |
 |---|---|---|
@@ -41,6 +41,7 @@ python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --pan
 | `circuit` | 2016-01-04 / 01-07 熔断日 | 这两天 `tradestatus` 仍为 1，多数面板判它可交易 |
 | `t1` | 当日买入是否当日卖出 | A 股 **T+1**；通用框架默认 T+0，拿来跑 A 股不会有任何提示 |
 | `suspension` | 是否在停牌日成交 | 那天根本没有交易 |
+| `held_through_suspension` | 持仓是否穿越了停牌期 | 那段时间账面在算收益，而你既不能卖也不能止损 |
 | `price_convention` | 成交价是原始价还是复权价 | 复权价不是任何一天真实的报价，涨停价/股数/价格阈值都会错 |
 | `survivorship` | 退市股在不在样本里 | 只在活到今天的票上回测 → **高估收益** |
 
