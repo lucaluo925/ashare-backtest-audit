@@ -63,14 +63,14 @@ def build(codes, start, end, out):
     try:
         for i, code in enumerate(codes, 1):
             rs = bs.query_history_k_data_plus(
-                code, "date,code,close,preclose,isST,tradestatus",
+                code, "date,code,open,close,preclose,isST,tradestatus",
                 start_date=start, end_date=end, frequency="d", adjustflag="3")
             rows = []
             while rs.error_code == "0" and rs.next():
                 rows.append(rs.get_row_data())
             if not rows:
                 continue
-            d = pd.DataFrame(rows, columns=["date", "code", "close",
+            d = pd.DataFrame(rows, columns=["date", "code", "open", "close",
                                             "preclose", "isST", "tradestatus"])
             frames.append(d)
             if i % 200 == 0:
@@ -82,7 +82,7 @@ def build(codes, start, end, out):
         raise SystemExit("一条数据都没取到")
     p = pd.concat(frames, ignore_index=True)
     p["date"] = pd.to_datetime(p["date"])
-    for c in ("close", "preclose"):
+    for c in ("open", "close", "preclose"):
         p[c] = pd.to_numeric(p[c], errors="coerce")
     p["is_st"] = p["isST"].astype(str).str.strip().eq("1")
     p["tradable"] = p["tradestatus"].astype(str).str.strip().eq("1")
@@ -97,11 +97,14 @@ def build(codes, start, end, out):
     up, dn = limit_prices(p["preclose"], p["limit_pct"])
     p["limit_up"] = (p["close"] - up).abs() <= TOL
     p["limit_down"] = (p["close"] - dn).abs() <= TOL
+    # 开盘封板：按开盘价成交的引擎，看的是这两个
+    p["open_limit_up"] = (p["open"] - up).abs() <= TOL
+    p["open_limit_down"] = (p["open"] - dn).abs() <= TOL
 
     # close_raw 用来算复牌首日的跳空幅度（held_through_suspension 检查）
     p["close_raw"] = p["close"]
     cols = ["date", "code", "limit_up", "limit_down", "is_st", "tradable",
-            "close_raw"]
+            "close_raw", "open_limit_up", "open_limit_down"]
     p[cols].to_parquet(out, index=False)
     print(f"→ {out}  {len(p):,} 行  "
           f"封涨停 {int(p['limit_up'].sum()):,}  封跌停 {int(p['limit_down'].sum()):,}")

@@ -31,11 +31,12 @@ python3 ashare_audit_standalone.py 你的成交.csv --panel panel.parquet
 python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --panel panel.parquet
 ```
 
-## 它查什么（九项）
+## 它查什么（十项）
 
 | 检查 | 问题 | 为什么重要 |
 |---|---|---|
 | `limit_fill` | 涨停日买入 / 跌停日卖出 | 回测成交了，实盘成交不了 → **高估收益** |
+| `open_limit_fill` | **开盘**涨停日买入 / 跌停日卖出 | 按开盘价成交的引擎看这一项；与上一项**互补，不要相加** |
 | `limit_rule` | 涨跌幅是否按**当日生效的规则**取 | 创业板 2020-08-24 才从 ±10% 放宽到 ±20% |
 | `stamp_duty` | 印花税是否分段 | 2023-08-28 减半；**2008-09-19 之前是双边征收** |
 | `circuit` | 2016-01-04 / 01-07 熔断日 | 这两天 `tradestatus` 仍为 1，多数面板判它可交易 |
