@@ -426,6 +426,51 @@ def board_access_threshold(code):
     """交易该板块所需的账户资产门槛（元，20 个交易日日均）。"""
     return BOARD_ACCESS_THRESHOLD_YUAN[board(code)]
 
+
+# ---------- 股息红利差别化个人所得税 ----------
+#
+# 出处（一手）：《财政部 国家税务总局 证监会关于上市公司股息红利差别化个人
+# 所得税政策有关问题的通知》财税〔2015〕101 号，**2015-09-08 起**：
+#   持股 1 个月以内（含）        股息红利全额计入应纳税所得额 → 实际税率 20%
+#   持股 1 个月以上至 1 年（含）  减按 50% 计入               → 实际税率 10%
+#   持股超过 1 年                暂免征收个人所得税           → 实际税率 0%
+# 调整前（财税〔2012〕85 号，2013-01-01 起）超过 1 年的按 25% 计入 → 5%。
+#
+# **这一条是复权价回测里一个系统性的、谁都不算的高估。** 前/后复权价把分红
+# 按 100% 还原进价格序列，等于假设股息免税；而月度换仓的策略实际只拿到 80%。
+# A 股全市场股息率量级 2%，20% 的税就是每年 0.4% —— 和手续费同一个数量级，
+# 但手续费人人都算，这个没人算。
+#
+# 2013-01-01 之前的档我没核到原文，所以 dividend_tax_rate() 对更早的日期
+# 返回 None（不判），不编一个数填上去。
+
+DIVIDEND_TAX_SCHEDULE = (
+    # (生效日, 1个月以内, 1个月~1年, 超过1年)
+    ("2015-09-08", 0.20, 0.10, 0.00),
+    ("2013-01-01", 0.20, 0.10, 0.05),
+)
+ONE_MONTH_DAYS = 30
+ONE_YEAR_DAYS = 365
+
+
+def dividend_tax_rate(holding_days, date):
+    """个人投资者股息红利的实际税率；date 早于 2013-01-01 返回 None（未核）。
+
+    holding_days 用自然日。税务口径按「1 个月」、「1 年」表述，这里用 30 / 365
+    近似 —— 边界上会差一两天，但策略的持仓期通常离边界很远，
+    真正贴着边界做税务套利的不是回测该管的事。
+    """
+    if holding_days < 0:
+        raise ValueError("持股天数不能为负")
+    for eff, r_short, r_mid, r_long in DIVIDEND_TAX_SCHEDULE:
+        if date >= eff:
+            if holding_days <= ONE_MONTH_DAYS:
+                return r_short
+            if holding_days <= ONE_YEAR_DAYS:
+                return r_mid
+            return r_long
+    return None
+
 # ============================================================
 # 来自 src/audit_formats.py
 # ============================================================
@@ -585,7 +630,7 @@ def positions_to_trades(path, date_col="date", code_col="code",
 那些查的是"代码有没有读到未来的值"，与市场无关。这里查的是
 **"A 股这一年的规则是什么，你的回测按的是哪一年的规则"** —— 目前没有工具做这个。
 
-十六项检查。绝大多数对应本项目自己真犯过并修好的错 ——
+十七项检查。绝大多数对应本项目自己真犯过并修好的错 ——
 这不是"我想到可能有坑"的清单，是"我掉进去过"的清单。
 
 | 检查 | 查什么 | 出处 |
@@ -605,6 +650,7 @@ def positions_to_trades(path, date_col="date", code_col="code",
 | st_buy_cap | 风险警示股单日买入 50 万股上限（需 qty 列）| |
 | naked_short | 卖出手里没有的票 —— **A 股裸卖空不存在** | |
 | board_permission | 科创板/北交所需 50 万、创业板 10 万的账户权限门槛 | |
+| dividend_tax | 复权价按免税算分红，个人实际要交 20%/10% | |
 | survivorship | 退市股票在不在样本里 | 面板含 241 只已退市 |
 
 哪些规则查了、哪些没查、没查的原因，逐条写在发布包的 RULE_INVENTORY.md。
@@ -1315,6 +1361,84 @@ def check_board_permission(trades, capital_yuan=None):
     return out
 
 
+def median_holding_days(trades):
+    """从成交记录推每笔持仓的自然日天数，返回中位数；推不出来返回 None。
+
+    按代码先进先出配对买卖。只用配得上对的那些 —— 期末还拿着的持仓
+    不知道什么时候卖，不猜。
+    """
+    if not len(trades):
+        return None
+    d = trades.sort_values("date", kind="mergesort")
+    open_lots, spans = {}, []
+    for row in d.itertuples(index=False):
+        side = str(row.side).strip().lower()
+        if side == "buy":
+            open_lots.setdefault(row.code, []).append(row.date)
+        elif side == "sell":
+            lots = open_lots.get(row.code)
+            if lots:
+                spans.append((pd.Timestamp(row.date)
+                              - pd.Timestamp(lots.pop(0))).days)
+    if not spans:
+        return None
+    spans.sort()
+    n = len(spans)
+    return float(spans[n // 2] if n % 2 else (spans[n // 2 - 1] + spans[n // 2]) / 2)
+
+
+def check_dividend_tax(trades, dividend_yield=None):
+    """复权价把分红按 100% 还原，但个人投资者的股息红利是**要交税**的。
+
+    出处：财税〔2015〕101 号（2015-09-08 起）—— 持股 1 个月以内 20%、
+    1 个月至 1 年 10%、超过 1 年免征。
+
+    为什么这条值得单独查：前/后复权价序列等于假设股息免税，而短持仓的策略
+    实际只拿到 80%。A 股股息率量级 2%，20% 的税就是每年 0.4% ——
+    和手续费同一个数量级，但手续费人人都算，这个没人算。
+
+    **这是上界，不是点估计**：年化高估 ≈ 股息率 × 税率 只在「策略全年在场、
+    分红都落在持仓窗口内」时成立。分红大多落在持仓之外就更小。
+    工具按上界说话，并把这句话一起输出 —— 不把上界当成实际损失。
+    """
+    out = []
+    if not len(trades):
+        return out
+    hold = median_holding_days(trades)
+    if hold is None:
+        return out
+    d0 = str(pd.Timestamp(trades["date"].min()).date())
+    rate = dividend_tax_rate(hold, d0)
+    if rate is None:
+        out.append(_f("轻微", "dividend_tax",
+                      "样本早于 2013-01-01，股息红利税的当时档位我没核到原文，"
+                      "这一项**没判**"))
+        return out
+    if rate == 0:
+        return out
+    bracket = "1 个月以内" if hold <= ONE_MONTH_DAYS else "1 个月至 1 年"
+    detail = (f"中位持仓 {hold:.0f} 天 → 落在「{bracket}」档，实际税率 "
+              f"{rate:.0%}（财税〔2015〕101 号）。"
+              "复权价序列把分红按 100% 还原进价格，等于假设股息免税。")
+    if dividend_yield is None:
+        out.append(_f("轻微", "dividend_tax",
+                      f"中位持仓 {hold:.0f} 天，股息红利实际税率 {rate:.0%} —— "
+                      "复权价回测默认按免税算",
+                      detail + " 传 --dividend-yield（如 0.02）"
+                      "让我把年化高估的上界算出来。"))
+        return out
+    if dividend_yield < 0:
+        raise ValueError("股息率不能为负")
+    drag = dividend_yield * rate
+    out.append(_f("中等" if drag >= 0.002 else "轻微", "dividend_tax",
+                  f"股息红利税让年化收益最多高估 {drag:.2%}"
+                  f"（股息率 {dividend_yield:.2%} × 税率 {rate:.0%}）",
+                  detail + " **这是上界不是点估计**：只在策略全年在场、"
+                  "分红都落在持仓窗口内时成立，分红多落在持仓之外就更小。"
+                  "和手续费同一个数量级，但手续费人人都算，这个没人算。"))
+    return out
+
+
 def check_survivorship(trades, panel):
     """样本里一只退市股都没有 → 几乎一定是幸存者偏差。"""
     out = []
@@ -1389,7 +1513,8 @@ def report_trials(n_trials, observed, sd, mean):
 
 def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None,
         assumed_cost_bps=None, assumed_min_commission=None,
-        order_type="limit", capital_yuan=None):
+        order_type="limit", capital_yuan=None,
+        dividend_yield=None):
     f = []
     f += check_limit_fill(trades, panel)
     f += check_open_limit_fill(trades, panel)
@@ -1406,6 +1531,7 @@ def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None,
     f += check_st_buy_cap(trades, panel)
     f += check_naked_short(trades)
     f += check_board_permission(trades, capital_yuan)
+    f += check_dividend_tax(trades, dividend_yield)
     f += check_survivorship(trades, panel)
     return sorted(f, key=lambda x: SEV.index(x["severity"]))
 
@@ -1435,6 +1561,9 @@ def main(argv=None):
                     help="被审回测假设的印花税，如 5")
     ap.add_argument("--framework", choices=sorted(FRAMEWORK_PROFILES),
                     help="直接套用某框架的默认假设")
+    ap.add_argument("--dividend-yield", type=float, default=None,
+                    help="组合的年化股息率（如 0.02），用来算股息红利税"
+                         "带来的年化高估上界")
     ap.add_argument("--capital", type=float, default=None,
                     help="回测本金（元），用来核板块权限门槛（科创板/北交所"
                          "50 万、创业板 10 万）")
@@ -1489,7 +1618,7 @@ def main(argv=None):
     pan = pd.read_parquet(a.panel, columns=[c for c in want if c in have])
     fs = run(tr, pan, a.assumed_limit_pct, a.assumed_stamp_bps,
              a.assumed_cost_bps, a.assumed_min_commission, a.order_type,
-             a.capital)
+             a.capital, a.dividend_yield)
     print(f"审计 {len(tr)} 笔成交，{tr['code'].nunique()} 只股票，"
           f"{tr['date'].min().date()} ~ {tr['date'].max().date()}\n")
     if not fs:
