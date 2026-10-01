@@ -65,17 +65,22 @@ def main():
               f"，偏低 {int((actual < hu).sum()):,} / 偏高 {int((actual > hu).sum()):,}")
 
     print("\n### 二、后果：真实封跌停却没被判出来（回测照样卖出）")
+    # 两种成交时点都算：被审项目默认 next_open，所以开盘价那一行才是它的实际口径
+    open_c = np.rint(p["open_raw"].astype("float64").to_numpy() * 100).astype(np.int64)
     hu_dn = exact_half_up(cents, 9, 10)
     act_dn = np.rint(np.round(prev_f * 0.9, 2) * 100).astype(np.int64)
-    real_down = close_c == hu_dn
-    missed = real_down & (close_c > act_dn)
-    blocked_wrongly = (close_c == act_dn) & (close_c < hu_dn)
-    print(f"  真实收在跌停价上：{int(real_down.sum()):,} 行")
-    print(f"  **没被判成跌停、于是回测里照样卖出**：{int(missed.sum()):,} 行"
-          f"（占真实跌停 {missed.sum() / max(real_down.sum(), 1):.2%}）")
-    print(f"  反方向（把没跌停的判成跌停、于是卖不出）：{int(blocked_wrongly.sum()):,} 行")
-    print("  → 这一侧**不保守**：策略在一个本来逃不掉的跌停日逃掉了，"
-          "收益被高估、回撤被低估。")
+    for px, name in ((open_c, "开盘价（next_open，被审项目的默认）"),
+                     (close_c, "收盘价（next_close）")):
+        real_down = px == hu_dn
+        missed = real_down & (px > act_dn)
+        wrong = (px == act_dn) & (px < hu_dn)
+        print(f"  [{name}]")
+        print(f"    真实落在跌停价上：{int(real_down.sum()):,} 行")
+        print(f"    **没被判成跌停、于是回测里照样卖出**：{int(missed.sum()):,} 行"
+              f"（占真实跌停 {missed.sum() / max(real_down.sum(), 1):.2%}）")
+        print(f"    反方向（把没跌停的判成跌停、卖不出）：{int(wrong.sum()):,} 行")
+    print("  → 卖出侧**不保守**：策略在一个本来逃不掉的跌停日逃掉了，"
+          "收益被高估、回撤被低估。两种成交时点下这个比例都在 5% 上下。")
 
     print("\n### 三、为什么 ±20% 的板块不会踩这个坑")
     print("  前收以分为单位（k 分）。×1.1 = 11k/10 分，第三位小数是 (11k mod 10)/10，")

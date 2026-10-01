@@ -68,9 +68,10 @@ python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --pan
 一份只挑对自己有利的证据的审计报告，没有资格叫审计报告。
 **[AUDIT_CASE_02.md](AUDIT_CASE_02.md)** 审的是另一类对象：一个**把 A 股约束
 当卖点**的框架（每道闸都写了）。那里问题的性质不同 —— 不是"有没有做"，而是
-"做得对不对、错在哪一侧"：它用 `(prev_close*1.1).round(2)` 算涨停价，
-银行家舍入比交易所口径系统性偏低 1 分，于是 **5.43% 的真实跌停日不会被判出来、
-回测里照样卖出**。数字由 [`case02_rounding.py`](case02_rounding.py) 在 1100 万行
+"做得对不对、错在哪一侧"：它的涨跌停价**算在后复权价上**，而这个量只在未复权价上
+有定义。案例里**也记了我自己在这份审计里犯的错**（第一版把一组未复权面板上的数字
+当成了它默认路径的影响，草稿作废），因为在审计报告里搞错被审对象的数据口径
+是最低级也最致命的错。数字由 [`case02_rounding.py`](case02_rounding.py) 在 1100 万行
 面板上算出（公开仓库不随附面板，用 `make_reference_panel.py` 自建一份即可复核）。
 
 生态层面的横向体检见 **[ECOSYSTEM_REPORT.md](ECOSYSTEM_REPORT.md)**。
