@@ -150,7 +150,10 @@ pandas/numpy 的 `.round()` 是**银行家舍入**（四舍六入五成双），
 假定了输入是未复权价，没有去追 `load()` 的 `adjust` 默认值。**
 
 和本项目记过的"看到形状像 bug 的片段、没读上下文就下结论"是同一个毛病。
-草稿已作废，原文保留在 `patterns/drafts/issue_Moliseeee_quant.md.void`
+两份草稿都已作废（v1 搞错数据口径，v2 把复权空间里不存在的问题写成头条），
+原文保留在 `patterns/drafts/issue_Moliseeee_quant.md.void`
+与 `issue_Moliseeee_quant_v2.md.void`，第三版在 `issue_Moliseeee_quant_v3.md`。
+原 v1 的说明：
 （开头加了作废说明）。**它进版本库是刻意的** —— 本仓库 `.gitignore` 里写着
 "支撑结论的东西不能只存在于某台机器的 out/ 目录里"，而这份作废草稿正是
 "我这次犯了什么错"这条结论的唯一依据。重写后的版本在

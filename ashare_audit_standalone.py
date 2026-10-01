@@ -152,8 +152,51 @@ def stamp_is_both_sides(date):
 #
 # 单位统一成"占成交金额的比例"。
 TRANSFER_FEE_RATE = 0.00001      # 过户费 0.001%，**双边**，沪深统一
-HANDLING_FEE_RATE = 0.0000341    # 经手费 0.0341‰，双边
-REGULATORY_FEE_RATE = 0.00002    # 证管费 0.02‰，双边
+
+# 经手费有历史分段，而且**减半日和印花税是同一天**。
+# 出处（一手）：《上海证券交易所关于调整股票交易经手费收费标准的通知》——
+#   A 股由成交金额的 **0.00487% 双向** 下调为 **0.00341% 双向**，
+#   **自 2023-08-28 起**（深交所同步、同比例；北交所降 50%，未核其费率）。
+# 这个日期与印花税 0.1% → 0.05% 是同一天（同批降费政策）。
+#
+# **0.00487% 这一档本身从哪天开始，我没核到原文**，所以它被用于 2023-08-28 之前的
+# 全部日期 —— 这是"手上最好的已知值"，不是"已核的历史全貌"。
+# 跨 2008 年之前的样本不要依赖这个数。
+HANDLING_FEE_SCHEDULE = (
+    ("2023-08-28", 0.0000341),   # 0.00341%
+    ("0000-01-01", 0.0000487),   # 0.00487%，起始日未核
+)
+
+# 证管费：《关于调整上海证券市场证券交易监管费收费标准的通知》
+#   按交易额 0.04‰ → **0.02‰**，**自 2012-01-01 起**（清算参数 2012-09-01 起调整）。
+# 注意：这份通知**没有写明单边还是双边**；"双边"的口径来自券商费用公示。
+REGULATORY_FEE_SCHEDULE = (
+    ("2012-01-01", 0.00002),     # 0.02‰
+    ("0000-01-01", 0.00004),     # 0.04‰
+)
+
+# 当前档，保留给不关心历史的调用方（等于各自 schedule 的第一项）
+HANDLING_FEE_RATE = HANDLING_FEE_SCHEDULE[0][1]
+REGULATORY_FEE_RATE = REGULATORY_FEE_SCHEDULE[0][1]
+
+
+def _rate_on(schedule, date, what):
+    if not isinstance(date, str):
+        raise TypeError(f"date 必须是 'YYYY-MM-DD' 字符串，收到 {type(date).__name__}")
+    for eff, rate in schedule:
+        if date >= eff:
+            return rate
+    raise ValueError(f"{what}费率表没有覆盖 {date}")
+
+
+def handling_fee_rate_on(date):
+    """经手费率（单边，占成交金额）。2023-08-28 起 0.00341%，之前 0.00487%。"""
+    return _rate_on(HANDLING_FEE_SCHEDULE, date, "经手")
+
+
+def regulatory_fee_rate_on(date):
+    """证管费率（单边，占成交金额）。2012-01-01 起 0.02‰，之前 0.04‰。"""
+    return _rate_on(REGULATORY_FEE_SCHEDULE, date, "证管")
 MIN_COMMISSION_YUAN = 5.0        # 佣金起点 5 元/笔（券商普遍）
 MAX_COMMISSION_RATE = 0.003      # 佣金上限 0.3%
 
@@ -167,7 +210,8 @@ def regulatory_cost_rate(date, side):
     """
     if side not in ("buy", "sell"):
         raise ValueError(f"side 应为 buy/sell，收到 {side!r}")
-    r = TRANSFER_FEE_RATE + HANDLING_FEE_RATE + REGULATORY_FEE_RATE
+    r = (TRANSFER_FEE_RATE + handling_fee_rate_on(date)
+         + regulatory_fee_rate_on(date))
     if side == "sell":
         r += stamp_duty_bps_on(date) / 1e4
     elif stamp_is_both_sides(date):
