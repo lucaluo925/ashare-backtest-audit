@@ -61,6 +61,13 @@ python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --pan
 **[RULE_INVENTORY.md](RULE_INVENTORY.md)**。一个审计工具最危险的失败
 不是漏报，是让人以为它查全了。
 
+它在真实项目上查出过什么：**[AUDIT_CASE_01.md](AUDIT_CASE_01.md)** 是一份
+完整案例（一个公开的 28 套短线策略项目），里面每个数都由
+[`case01_recheck.py`](case01_recheck.py) 生成、数据是该项目**自己发布**的汇总，
+任何人能重跑复核。案例里**对它有利的结论也写了**（它的成本模型偏保守）——
+一份只挑对自己有利的证据的审计报告，没有资格叫审计报告。
+生态层面的横向体检见 **[ECOSYSTEM_REPORT.md](ECOSYSTEM_REPORT.md)**。
+
 ## 输出长什么样
 
 ```
