@@ -471,6 +471,42 @@ def dividend_tax_rate(holding_days, date):
             return r_long
     return None
 
+
+# ---------- 除权除息日：涨跌停的参考价不是前一天的收盘价 ----------
+#
+# 交易所算涨跌停价用的是**除权参考价**，不是原始的前收盘。数据商一般直接给一个
+# `preclose` 字段，它已经做过除权调整（baostock 在 adjustflag=3 下就是这样）。
+# 很多引擎图方便写成 `close.shift(1)`，在除权日就是错的。
+#
+# 实测的例子（baostock，2026-10 核过）：sh.600000 2017-05-25 除权，
+#   preclose = 11.75（除权参考价），原始前收 = 15.47
+#   用 preclose 算涨停价 ≈ 12.93（当天实际就封在 12.93）
+#   用 close.shift(1) 算出来是 17.02 —— 封板判定完全反过来
+# 送转日更夸张：原始价能跳 50% 以上。
+#
+# 这个函数做的事很小：给定数据商的 preclose 和前一行的 close，判断这一天是不是
+# 除权除息/送转日。它放在规则模块里而不是下载脚本里，因为这是一条**规则**
+# （参考价怎么取），而且这样它才有测试覆盖 —— 下载脚本没法在没有网的环境里测。
+
+EX_RIGHTS_TOL = 0.005        # 半分；两者差到半分以上才算除权
+
+
+def is_ex_rights(preclose, prev_close, tol=EX_RIGHTS_TOL):
+    """这一天是否除权除息/送转。
+
+    preclose：数据商给的、已做除权调整的昨收
+    prev_close：前一个交易日的实际收盘价
+    任一为缺失（如上市首日没有前一行）→ 返回 False，**不猜**。
+    """
+    if preclose is None or prev_close is None:
+        return False
+    if preclose != preclose or prev_close != prev_close:      # NaN
+        return False
+    try:
+        return abs(float(preclose) - float(prev_close)) > tol
+    except (TypeError, ValueError):
+        return False
+
 # ============================================================
 # 来自 src/audit_formats.py
 # ============================================================
@@ -630,7 +666,7 @@ def positions_to_trades(path, date_col="date", code_col="code",
 那些查的是"代码有没有读到未来的值"，与市场无关。这里查的是
 **"A 股这一年的规则是什么，你的回测按的是哪一年的规则"** —— 目前没有工具做这个。
 
-十七项检查。绝大多数对应本项目自己真犯过并修好的错 ——
+十八项检查。绝大多数对应本项目自己真犯过并修好的错 ——
 这不是"我想到可能有坑"的清单，是"我掉进去过"的清单。
 
 | 检查 | 查什么 | 出处 |
@@ -651,6 +687,7 @@ def positions_to_trades(path, date_col="date", code_col="code",
 | naked_short | 卖出手里没有的票 —— **A 股裸卖空不存在** | |
 | board_permission | 科创板/北交所需 50 万、创业板 10 万的账户权限门槛 | |
 | dividend_tax | 复权价按免税算分红，个人实际要交 20%/10% | |
+| ex_rights | 成交落在除权日 —— 那天的涨跌停参考价不是前一天收盘 | |
 | survivorship | 退市股票在不在样本里 | 面板含 241 只已退市 |
 
 哪些规则查了、哪些没查、没查的原因，逐条写在发布包的 RULE_INVENTORY.md。
@@ -941,6 +978,12 @@ def check_price_convention(trades, panel):
                       f"比值波动最大的是 {worst[0]}（{worst[1]:.1%}）。"
                       "复权价不是任何一天真实的报价，所以涨停价、每手股数、"
                       "绝对价筛选都要改用原始价算。"
+                      "／**这一条的后果比「价格不对」大得多**：涨跌停价这个量"
+                      "只在未复权价上有定义（交易所按除权参考价 ±幅度、"
+                      "四舍五入到分）。拿复权价去算涨跌停，等于在一个不存在的"
+                      "价格刻度上做可成交性判定 —— 而误差大小取决于每只票的"
+                      "复权因子，没有统一的量级。整手（100 股的整数倍）和"
+                      "最小变动价位（0.01 元）同理。"
                       "／本项无法判断是前复权还是后复权：两者在单份成交记录上"
                       "不可分辨。要分辨就隔一段时间重新下载一次同一段历史，"
                       "**前复权的历史值会变，后复权不会** —— 而历史会变的回测"
@@ -1447,6 +1490,50 @@ def check_dividend_tax(trades, dividend_yield=None):
     return out
 
 
+def check_ex_rights(trades, panel):
+    """成交落在**除权除息日**上 —— 这些天的涨跌停参考价不是前一天的收盘价。
+
+    交易所算涨跌停价用的是**除权参考价**，不是原始的前收盘。数据商（baostock、
+    tushare 等）一般直接给一个 `preclose` 字段，它已经做过除权调整；
+    而很多引擎图方便写成 `close.shift(1)`，在除权日就是错的。
+
+    错得有多狠，用一个实测的例子说清：sh.600000 在 2017-05-25 除权，
+    `preclose = 11.75`（除权参考价），原始前收是 15.47。
+    用 preclose 算的涨停价约 12.93（当天实际就封在 12.93）；
+    用 `close.shift(1)` 算出来是 **17.02** —— 这一天的封板判定会完全反过来。
+    送转日更夸张：原始价能跳 50% 以上。
+
+    **这条检查判不出你的引擎用的是哪一个** —— 成交记录里看不到。
+    它做的是把落在除权日上的成交点出来，让你自己去核那一行代码。
+    这是刻意的：猜一个答案然后报"你错了"，比不报更坏。
+    """
+    out = []
+    if not len(trades) or "ex_rights" not in panel.columns:
+        return out
+    xr = panel.loc[_as_bool(panel["ex_rights"]), ["date", "code"]].copy()
+    if not len(xr):
+        return out
+    xr["date"] = pd.to_datetime(xr["date"]).dt.normalize()
+    xr = xr.drop_duplicates()
+    t = trades[["date", "code"]].copy()
+    t["date"] = pd.to_datetime(t["date"]).dt.normalize()
+    hit = t.merge(xr, on=["date", "code"], how="inner")
+    if not len(hit):
+        return out
+    frac = len(hit) / len(trades)
+    out.append(_f("中等" if frac > 0.01 else "轻微", "ex_rights",
+                  f"{len(hit)} 笔成交（{frac:.2%}）落在除权除息日上",
+                  f"例：{hit['code'].iloc[0]} "
+                  f"{pd.Timestamp(hit['date'].iloc[0]).date()}。"
+                  "这些天的涨跌停参考价是**除权参考价**，不是前一天的收盘价。"
+                  "去核一行代码：你算涨跌停价用的是数据商给的 `preclose`，"
+                  "还是 `close.shift(1)`？后者在这些天上会算出一个离谱的阈值"
+                  "（实测过一个例子：真实涨停价 12.93，用 shift 算出 17.02），"
+                  "于是该判封板的没判、不该判的判了。"
+                  "**本检查判不出你用的是哪一个 —— 成交记录里看不到，所以不猜。**"))
+    return out
+
+
 def check_survivorship(trades, panel):
     """样本里一只退市股都没有 → 几乎一定是幸存者偏差。"""
     out = []
@@ -1540,6 +1627,7 @@ def run(trades, panel, assumed_limit_pct=None, assumed_stamp_bps=None,
     f += check_naked_short(trades)
     f += check_board_permission(trades, capital_yuan)
     f += check_dividend_tax(trades, dividend_yield)
+    f += check_ex_rights(trades, panel)
     f += check_survivorship(trades, panel)
     return sorted(f, key=lambda x: SEV.index(x["severity"]))
 

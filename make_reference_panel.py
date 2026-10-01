@@ -29,7 +29,11 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from ashare_audit_standalone import has_price_limit, limit_pct  # noqa: E402
+from ashare_audit_standalone import (  # noqa: E402
+    has_price_limit,
+    is_ex_rights,
+    limit_pct,
+)
 
 
 # 判定封板用**半分容差**，不用取整后精确相等。
@@ -97,6 +101,20 @@ def build(codes, start, end, out):
     up, dn = limit_prices(p["preclose"], p["limit_pct"])
     p["limit_up"] = (p["close"] - up).abs() <= TOL
     p["limit_down"] = (p["close"] - dn).abs() <= TOL
+    # 除权日：baostock 在 adjustflag=3 下给的 preclose 已经是**除权除息调整后的
+    # 昨收**，也就是交易所算涨跌停价用的那个参考价。于是"前一行的 close 与本行的
+    # preclose 不相等"就精确等价于"这一天除权除息/送转了" —— 不用额外下载任何东西。
+    #
+    # 为什么要把这一列发出去：很多引擎用 `close.shift(1)` 当参考价算涨跌停。
+    # 在除权日那是错的，而且可以错得很离谱（送转日原始价会跳 50%）。
+    # 有了这一列，审计器能把落在这些天上的成交单独点出来。
+    # 判定本身在 ashare_rules.is_ex_rights 里（那边有测试覆盖）——
+    # 这个下载脚本在没网的环境里跑不起来，所以规则不留在这里。
+    p = p.sort_values(["code", "date"])
+    prev_close = p.groupby("code", observed=True)["close"].shift(1)
+    p["ex_rights"] = [is_ex_rights(pc, prv)
+                      for pc, prv in zip(p["preclose"], prev_close)]
+
     # 开盘封板：按开盘价成交的引擎，看的是这两个
     p["open_limit_up"] = (p["open"] - up).abs() <= TOL
     p["open_limit_down"] = (p["open"] - dn).abs() <= TOL
@@ -124,7 +142,8 @@ def build(codes, start, end, out):
 
     # close_raw 用来算复牌首日的跳空幅度（held_through_suspension 检查）
     p["close_raw"] = p["close"]
-    cols = ["date", "code", "limit_up", "limit_down", "is_st", "tradable",
+    cols = ["date", "code", "preclose", "ex_rights",
+            "limit_up", "limit_down", "is_st", "tradable",
             "close_raw", "open_limit_up", "open_limit_down"]
     p[cols].to_parquet(out, index=False)
     print(f"→ {out}  {len(p):,} 行  "

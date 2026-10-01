@@ -31,7 +31,7 @@ python3 ashare_audit_standalone.py 你的成交.csv --panel panel.parquet
 python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --panel panel.parquet
 ```
 
-## 它查什么（十七项）
+## 它查什么（十八项）
 
 | 检查 | 问题 | 为什么重要 |
 |---|---|---|
@@ -47,6 +47,7 @@ python3 ashare_audit_standalone.py 持仓.csv --positions --qty-col weight --pan
 | `cost_floor` | 成本假设是否低于监管费用地板、有没有佣金起点 | 过户费/经手费/证管费三项双边约 1.3bp 一轮；**佣金起点 5 元**在小单上让费率翻倍 |
 | `order_size` | 整手约束、单笔申报上限、ST 单日 50 万股买入上限 | 按权重回测的策略落地要取整：一只 300 元的股票一手 3 万元 |
 | `tick_size` | 成交价是否落在 0.01 元的最小变动单位上 | 不落在分上的价格在市场上不存在 —— 说明你成交在均价而非可申报价 |
+| `ex_rights` | 成交落在除权除息日 | 那天的涨跌停参考价是**除权参考价**，不是前一天收盘。实测例：真实涨停价 12.93，用 `close.shift(1)` 算出 **17.02** |
 | `naked_short` | 卖出手里没有的票 | **A 股裸卖空不存在** —— 多空/截面做空的回测，空头那半边收益整个不存在 |
 | `board_permission` | 策略池涉及的板块需要什么账户权限 | 科创板/北交所需 20 日日均资产 50 万、创业板 10 万，外加 24 个月交易经历 |
 | `dividend_tax` | 复权价把分红按免税还原，个人实际要交 20%/10% | 持股 1 个月以内 20%、1 个月至 1 年 10%、超过 1 年免征；股息率 2% 时就是每年 0.4% —— **和手续费同一个数量级，但没人算** |
