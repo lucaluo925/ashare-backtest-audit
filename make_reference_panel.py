@@ -30,6 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from ashare_audit_standalone import (  # noqa: E402
+    normalize_code,
     has_price_limit,
     is_ex_rights,
     limit_pct,
@@ -57,7 +58,7 @@ def limit_prices(preclose, pct):
     return preclose * (1 + pct), preclose * (1 - pct)
 
 
-def build(codes, start, end, out):
+def build(codes, start, end, out, full_universe=True):
     import baostock as bs
 
     lg = bs.login()
@@ -142,7 +143,12 @@ def build(codes, start, end, out):
 
     # close_raw 用来算复牌首日的跳空幅度（held_through_suspension 检查）
     p["close_raw"] = p["close"]
-    cols = ["date", "code", "preclose", "ex_rights",
+    # 这份面板是不是全市场 —— 幸存者偏差只能在全市场面板上查。
+    # 标在数据里而不是只在文档里：否则用窄面板跑出来的"未发现幸存者偏差"
+    # 会被当成"通过"，而那是本工具最该避免的那种静默降级。
+    p["panel_is_full_universe"] = bool(full_universe)
+
+    cols = ["date", "code", "preclose", "ex_rights", "panel_is_full_universe",
             "limit_up", "limit_down", "is_st", "tradable",
             "close_raw", "open_limit_up", "open_limit_down"]
     p[cols].to_parquet(out, index=False)
@@ -174,13 +180,46 @@ def main(argv=None):
     ap.add_argument("--out", default="panel.parquet")
     ap.add_argument("--codes", default=None,
                     help="逗号分隔的代码，如 sh.600000,sz.000001；默认全市场")
+    ap.add_argument("--from-trades", default=None,
+                    help="直接从成交记录 CSV 读代码与日期范围，只下这些票 —— "
+                         "全市场要几个小时，一份几十只票的记录只要几秒。"
+                         "代价：**幸存者偏差查不了**（见下）")
+    ap.add_argument("--pad-days", type=int, default=45,
+                    help="--from-trades 时在成交区间两头各留多少自然日 "
+                         "（T+1、停牌穿越、除权参考价都需要邻近交易日）")
     a = ap.parse_args(argv)
-    end = a.end or pd.Timestamp.today().strftime("%Y-%m-%d")
-    codes = ([c.strip() for c in a.codes.split(",")] if a.codes
-             else all_a_share_codes())
-    print(f"{len(codes)} 只股票，{a.start} ~ {end}")
-    print("注意：默认包含**已退市**股票 —— 少了它们就是幸存者偏差。")
-    build(codes, a.start, end, a.out)
+
+    full_universe = True
+    start, end = a.start, a.end or pd.Timestamp.today().strftime("%Y-%m-%d")
+    if a.from_trades:
+        if a.codes:
+            raise SystemExit("--from-trades 与 --codes 只能给一个")
+        tr = pd.read_csv(a.from_trades)
+        col_code = next((c for c in ("code", "代码", "symbol", "ts_code")
+                         if c in tr.columns), None)
+        col_date = next((c for c in ("date", "日期", "trade_date", "datetime")
+                         if c in tr.columns), None)
+        if not col_code or not col_date:
+            raise SystemExit(f"{a.from_trades} 里找不到代码列或日期列；"
+                             f"实际有 {list(tr.columns)}")
+        codes = sorted({normalize_code(c) for c in tr[col_code].dropna()})
+        d = pd.to_datetime(tr[col_date])
+        pad = pd.Timedelta(days=a.pad_days)
+        start = (d.min() - pad).strftime("%Y-%m-%d")
+        end = (d.max() + pad).strftime("%Y-%m-%d")
+        full_universe = False
+        print(f"从 {a.from_trades} 读出 {len(codes)} 只股票；"
+              f"区间按成交记录两头各留 {a.pad_days} 天 → {start} ~ {end}")
+        print("** 这份面板只含你交易过的股票，所以：**")
+        print("   - 幸存者偏差（survivorship）**查不了** —— 它要比对全市场的退市股。")
+        print("     审计器会读面板里的 panel_is_full_universe 标记并明说这一项没查。")
+        print("   - 其余 17 项都正常。想把幸存者偏差也查上，去掉 --from-trades 重建一次。")
+    else:
+        codes = ([c.strip() for c in a.codes.split(",")] if a.codes
+                 else all_a_share_codes())
+        print(f"{len(codes)} 只股票，{start} ~ {end}")
+        print("注意：默认包含**已退市**股票 —— 少了它们就是幸存者偏差。")
+    build(codes, start, end, a.out, full_universe=full_universe)
 
 
 if __name__ == "__main__":

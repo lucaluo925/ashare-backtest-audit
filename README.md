@@ -10,16 +10,42 @@
 
 ---
 
-## 60 秒上手
+## 上手
 
 ```bash
 pip install pandas pyarrow baostock
 
-# 1. 建参考面板（免费数据，默认含已退市股票）
-python3 make_reference_panel.py --start 2016-01-01 --out panel.parquet
+# 1. 建参考面板 —— 只下你交易过的那些票（十只量级十几秒，几十只一两分钟）
+python3 make_reference_panel.py --from-trades 你的成交.csv --out panel.parquet
 
-# 2. 审计你的成交记录
+# 2. 审计
 python3 ashare_audit_standalone.py 你的成交.csv --panel panel.parquet
+```
+
+`--from-trades` 从成交记录里读代码和日期范围（两头各留 45 天，T+1、停牌穿越、
+除权参考价都需要邻近交易日）。
+
+**要多久（实测，baostock 免费接口，逐只请求）**：
+
+| 规模 | 耗时 |
+|---|---|
+| 3 只 × 1 年 | 3.5 秒 |
+| 3 只 × 6 年 | 7.7 秒 |
+| 10 只 × 1 年 | 17 秒 |
+| 45 只 × 6.5 年 | 约 3 分钟 |
+| 全市场 5000+ 只 × 10 年 | **几个小时** |
+
+大头是**每只一次请求**的往返，不是数据量 —— 所以股票数比区间长度贵得多。
+（这几个数是跑出来的，不是估的。）
+
+**代价只有一项**：幸存者偏差查不了 ——
+它要比对全市场的退市股，窄面板里没有可比对象。面板里会写一个
+`panel_is_full_universe` 标记，审计器读到就明说这一项"没查"，**不会静默当成通过**。
+
+想把 18 项都查上，再建一次全市场面板（这一步要几小时，所以不放在"60 秒"里）：
+
+```bash
+python3 make_reference_panel.py --start 2016-01-01 --out panel_full.parquet
 ```
 
 成交记录只要有 `date, code, side` 三列。代码写成 `600000.SH`、`600000.SS`、

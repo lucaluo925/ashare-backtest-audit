@@ -1587,6 +1587,20 @@ def check_ex_rights(trades, panel):
 def check_survivorship(trades, panel):
     """样本里一只退市股都没有 → 几乎一定是幸存者偏差。"""
     out = []
+    # 面板自己标了"不是全市场"时，这一项**没法查**，要和"该有退市股却没有"分开说。
+    # 不分开的后果很具体：用只含自己交易过的股票的窄面板跑一遍，
+    # 看到"未发现幸存者偏差"就以为过了 —— 而那是本工具最该避免的静默降级。
+    if "panel_is_full_universe" in panel.columns:
+        full = _as_bool(panel["panel_is_full_universe"])
+        if len(full) and not bool(full.iloc[0]):
+            out.append(_f("轻微", "survivorship",
+                          "这份参考面板只含部分股票，幸存者偏差**没查**",
+                          "它要比对全市场的退市股，窄面板里压根没有可比的对象。"
+                          "想查这一项，用全市场面板重建一次"
+                          "（`make_reference_panel.py` 去掉 --from-trades）。"
+                          "**没查不等于通过** —— 幸存者偏差是单向高估收益的，"
+                          "而且在短线策略上尤其大。"))
+            return out
     traded = set(trades["code"])
     last = panel.groupby("code")["date"].max()
     panel_end = panel["date"].max()
@@ -1757,8 +1771,14 @@ def main(argv=None):
         print(f"由持仓表推出 {len(tr)} 笔成交（只取 0↔非0 的跃迁）\n")
     else:
         tr = read_trades(a.trades, a.date_col, a.code_col, a.side_col)
+    # **每加一项用到新面板列的检查，这里必须跟着加。** 漏掉的后果是静默的：
+    # 列被丢掉 → 那项检查当成"面板没这一列"直接跳过 → 输出里一个字都看不到。
+    # ex_rights 和 panel_is_full_universe 就这么漏过一轮（加了检查、没加到这里，
+    # 于是 CLI 路径上从未触发），是端到端跑窄面板时才发现的。
+    # test_cli_loads_every_panel_column_the_checks_use 现在守住这件事。
     want = ["date", "code", "limit_up", "limit_down", "is_st", "tradable",
-            "close_raw", "open_limit_up", "open_limit_down"]
+            "close_raw", "open_limit_up", "open_limit_down",
+            "ex_rights", "panel_is_full_universe"]
     import pyarrow.parquet as _pq
     have = set(_pq.ParquetFile(a.panel).schema_arrow.names)
     pan = pd.read_parquet(a.panel, columns=[c for c in want if c in have])
