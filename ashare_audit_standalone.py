@@ -1146,20 +1146,28 @@ def check_order_size(trades, order_type="limit"):
 def _as_bool(sr):
     """把面板里的 is_st 稳健地变成 bool。
 
-    直接 .astype(bool) 会把字符串 "False" 当成 True（非空字符串为真），
-    object dtype 上 fillna 还会触发 pandas 的 downcasting FutureWarning。
+    直接 .astype(bool) 会把字符串 "False" 当成 True（非空字符串为真）。
     这是代码审查抓出来的：一份 is_st 存成字符串的面板会让 ST 检查大面积误报。
+
+    **分支一律按类型语义判断，不看 dtype 的名字。** 第一版写的是
+    `sr.dtype == object or str(sr.dtype).startswith("string")`，在 pandas 2.x
+    上对，在 pandas 3.0 上错 —— 3.0 把默认字符串 dtype 换成了 `str`
+    （PDEP-14），名字不以 "string" 开头，于是字符串列落进数值分支、
+    `astype(float)` 碰上 "False" 直接抛异常。
+    dtype 的**名字**是会变的，`is_bool_dtype` / `is_numeric_dtype` 这层语义不会。
     """
-    if sr.dtype == bool:
-        return sr
-    if sr.dtype == object or str(sr.dtype).startswith("string"):
-        m = {"true": True, "1": True, "1.0": True, "y": True, "yes": True,
-             "是": True, "t": True,
-             "false": False, "0": False, "0.0": False, "n": False, "no": False,
-             "否": False, "f": False, "": False, "nan": False, "none": False}
-        return sr.map(lambda x: False if (x is None or x != x)
-                      else m.get(str(x).strip().lower(), bool(x))).astype(bool)
-    return sr.fillna(0).astype(float).ne(0)
+    if pd.api.types.is_bool_dtype(sr):
+        # 含 pd.NA 的 nullable boolean：先填 False 再转，直接 astype(bool) 会炸
+        return sr.fillna(False).astype(bool) if sr.isna().any() else sr.astype(bool)
+    if pd.api.types.is_numeric_dtype(sr):
+        return sr.fillna(0).astype(float).ne(0)
+    # 其余（字符串、object、混杂）一律按字面量映射
+    m = {"true": True, "1": True, "1.0": True, "y": True, "yes": True,
+         "是": True, "t": True,
+         "false": False, "0": False, "0.0": False, "n": False, "no": False,
+         "否": False, "f": False, "": False, "nan": False, "none": False}
+    return sr.map(lambda x: False if (x is None or x != x)
+                  else m.get(str(x).strip().lower(), bool(x))).astype(bool)
 
 
 def check_st_buy_cap(trades, panel):
