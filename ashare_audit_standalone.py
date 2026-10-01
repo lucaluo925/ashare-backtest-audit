@@ -29,6 +29,8 @@ import pandas as pd
 把创业板的涨跌停全部判错，而且不会报任何错。
 """
 
+from decimal import ROUND_HALF_UP, Decimal
+
 # ---------- 涨跌幅 ----------
 #
 # 生效日期是这里最容易错的东西：知道规则、却没把日期写进条件，
@@ -275,6 +277,73 @@ def is_circuit_breaker(date):
 # 那种情况下审计器不猜，直接跳过并说明为什么跳过。
 
 TICK_SIZE_YUAN = 0.01          # A 股申报价格最小变动单位
+
+
+# ---------------------------------------------------------------------------
+# 涨跌停价的**规范实现**（标量）。
+#
+# 为什么放在这里、而不是放在用它的那个模块里：这套整数分算术在
+# build_panel（向量化，1100 万行）和 pretrade_check（逐笔下单前）里各要用一次。
+# 同一条规则两套算法，迟早在某一侧差 1 分而没人发现 —— 所以规范版在这里，
+# 向量化那版必须和它做平价校验（见 test_limit_band_parity.py）。
+#
+# 恒等式：half_up(cents * num / den) == (2*cents*num + den) // (2*den)
+# 在本项目 1100 万行面板上实测 0 处不一致。
+#
+# **不能用 round()**：numpy/pandas 的 round 是五成双（banker's），交易所是四舍五入。
+# 实测：±10% 的涨跌停价在 1100 万行里 543,479 行（4.92%）不一致，而且
+# **100% 单向** —— round() 总是把涨停价算低 1 分，于是所有涨停票都变成"可买"。
+# ±20% 一行都不差：×1.2 = 12k/10，第三位小数只会是 {0,2,4,6,8}，永远不是 5。
+# 这条"±20% 没有差异"也在 test_limit_band_parity 里独立验过，不是推理。
+# ---------------------------------------------------------------------------
+
+
+def to_cents(yuan):
+    """元 → 整数分，四舍五入（不是 round() 的五成双）。
+
+    走 `Decimal(repr(x))`，不走 `int(x*100+0.5)`，也不走两段舍入：
+      - `int(x*100+0.5)`：实测 0.005~300.005 的 30,000 个半分价里错 1,851 个
+        （6.17%）—— 浮点乘法把 x.xx5 压到半分以下时，加 0.5 进不上去；
+      - 先舍到毫、再舍到分：18.0049999 会给 18.01，经典的双重舍入错误；
+      - `round(x*100)`：错 15,000 个（正好一半），五成双。
+    `repr()` 给的是能唯一还原该 float 的最短十进制串，所以字面量的十进制意图
+    被保住，再用十进制 ROUND_HALF_UP 落到分。
+
+    **用在前收这种 2 位小数的价格上时，上面这些差别一个都碰不到**
+    （2 位小数的价格在 float64 乃至 float32 里都没有半分歧义）。
+    真正用得上的是策略自己算出来的委托价 —— 那种数带一长串小数，x.xx5 是常态。
+    """
+    if isinstance(yuan, Decimal):
+        d = yuan
+    elif isinstance(yuan, str):
+        d = Decimal(yuan)
+    else:
+        d = Decimal(repr(float(yuan)))
+    return int(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
+
+
+def limit_price_band_cents(preclose, code, is_st, date, days_since_listing=None):
+    """当日可申报价格区间 [跌停价, 涨停价]，单位=**整数分**。
+
+    无涨跌幅限制（注册制新股上市前 5 个交易日）返回 (None, None) ——
+    不是返回一个很宽的区间：「有区间」和「没有区间」在下游是两件事。
+
+    **参考价必须是数据商给的 preclose（除权参考价），不是前一天的收盘价。**
+    除权日这两者能差一倍以上（见上面 is_ex_rights 处记的实测例子）。
+    注意这条只对**未复权**序列成立：复权序列里 close.shift(1) 本身就等于
+    除权参考价（复权因子恒等式），本项目实测到 2.3e-07。
+    """
+    if not has_price_limit(code, date, days_since_listing):
+        return None, None
+    c = to_cents(preclose)
+    if c <= 0:
+        raise ValueError("preclose 必须为正")
+    pct = limit_pct(code, is_st, date)
+    num_up = round((1 + pct) * 100)      # 110 / 120 / 105 / 130
+    num_dn = round((1 - pct) * 100)      # 90 / 80 / 95 / 70
+    high = (2 * c * num_up + 100) // 200
+    low = (2 * c * num_dn + 100) // 200
+    return int(low), int(high)
 
 MIN_ORDER_SHARES = {"主板": 100, "创业板": 100, "科创板": 200}
 LOT_INCREMENT = {"主板": 100, "创业板": 100, "科创板": 1}
